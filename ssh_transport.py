@@ -27,7 +27,7 @@ async def capture(command):
         output, error = await asyncio.wait_for(process.communicate(), timeout=15)
         if process.returncode:
             lines = error.decode(errors="replace").strip().splitlines()
-            raise RuntimeError(lines[-1] if lines else f"SSH exited with code {process.returncode}")
+            raise RuntimeError(lines[-1] if lines else f"{Path(command[0]).name} exited with code {process.returncode}")
         return output
     finally:
         await stop_process(process)

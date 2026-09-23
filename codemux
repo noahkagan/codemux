@@ -16,6 +16,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 
+from notifications import Notifications
 from ssh_transport import Connection, Connections, capture, stop_process
 
 
@@ -68,7 +69,7 @@ class Observation:
         return (self.snapshot.get("goal") or "-") if self.snapshot and not self.error else "-"
 
 
-async def watch_host(agents, observations, source, connection):
+async def watch_host(agents, observations, source, connection, notifications):
     """One SSH stream per host; reconnect without discarding the last response."""
     sessions = list(dict.fromkeys(item.session for item in agents))
     while True:
@@ -94,6 +95,7 @@ async def watch_host(agents, observations, source, connection):
                 values = json.loads(line)
                 for item in agents:
                     observations[item].update(values[item.session])
+                    notifications.observe(item, values[item.session])
         except asyncio.TimeoutError:
             for item in agents:
                 observations[item].error = "Status reader did not respond within 15 seconds"
@@ -390,15 +392,20 @@ class Dashboard:
         self.screen.nodelay(True)
         self.screen.keypad(True)
         source = Path(__file__).resolve().with_name("status_reader.py").read_bytes()
+        notifications = Notifications()
         async with Connections(self.agents) as self.connections:
             hosts = {}
             for agent in self.agents:
                 hosts.setdefault((agent.host, agent.proxy), []).append(agent)
-            readers = [asyncio.create_task(watch_host(group, self.observations, source, self.connections[group[0]]))
+            readers = [asyncio.create_task(watch_host(group, self.observations, source, self.connections[group[0]], notifications))
                        for group in hosts.values()]
+            notification_task = asyncio.create_task(notifications.run())
             try:
                 while True:
                     self.collect_exits()
+                    if notifications.error:
+                        self.message = notifications.error
+                        notifications.error = None
                     self.draw()
                     key = self.screen.getch()
                     if key != -1:
@@ -411,17 +418,18 @@ class Dashboard:
                             self.message = str(error)
                     await asyncio.sleep(0.05)
             finally:
-                for reader in readers:
-                    reader.cancel()
-                await asyncio.gather(*readers, return_exceptions=True)
+                for task in [*readers, notification_task]:
+                    task.cancel()
+                await asyncio.gather(*readers, notification_task, return_exceptions=True)
                 await asyncio.gather(*(forward.close() for forward in self.forwards.values()), return_exceptions=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     parser.add_argument("--config", type=Path,
-                        default=Path(__file__).resolve().with_name("agents.json"),
-                        help="agent list (default: agents.json beside this script)")
+                        default=config_home / "codemux" / "agents.json",
+                        help="agent list (default: $XDG_CONFIG_HOME/codemux/agents.json or ~/.config/codemux/agents.json)")
     args = parser.parse_args()
     try:
         entries = json.loads(args.config.read_text())

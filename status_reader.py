@@ -108,6 +108,7 @@ def read_thread(home, thread_id):
             response = {"id": row[0], "text": item["text"], "kind": kind, "timestamp": row[1]}
         return {
             "thread_id": thread_id,
+            "turn_id": turn[1] if turn else None,
             "turn": TURN_LABELS[turn[0]] if turn else "idle",
             "goal": goal[0] if goal else None,
             "response": response,
@@ -122,7 +123,7 @@ def codex_processes(pane_pids, inventory):
 def read_session(pane_pids, inventory):
     codex_pids = codex_processes(pane_pids, inventory)
     if not codex_pids:
-        return {"thread_id": None, "turn": "absent", "goal": None, "response": None}
+        return {"thread_id": None, "turn_id": None, "turn": "absent", "goal": None, "response": None}
     roots = set().union(*(root_threads(pid) for pid in codex_pids))
     if len(roots) != 1:
         raise ValueError(f"Expected one root Codex thread in this tmux session; found {len(roots)}")

@@ -128,7 +128,7 @@ class StatusReaderTests(unittest.TestCase):
 
     def test_no_codex_process_clears_thread_response_and_goal(self):
         value = reader.read_session({10}, {10: (1, "bash"), 30: (1, "codex")})
-        self.assertEqual(value, {"thread_id": None, "turn": "absent", "goal": None, "response": None})
+        self.assertEqual(value, {"thread_id": None, "turn_id": None, "turn": "absent", "goal": None, "response": None})
 
 
 class SnapshotTests(unittest.IsolatedAsyncioTestCase):

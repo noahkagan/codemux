@@ -8,16 +8,22 @@ Select an agent, attach to its tmux session, or forward a web server to your bro
 Requires Linux, Python 3.10+, and OpenSSH `ssh` on the controller.
 Teleport hosts also require `tsh`.
 The remote hosts need Linux, Python 3.10+, `tmux`, and Codex. Browser launching uses `xdg-open`.
+Desktop notifications use `notify-send` and the controller's desktop notification service.
 There are no Python packages to install.
 
 ```bash
 cd ~/codemux
 ./install.sh
-codemux
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codemux"
+mkdir -p "$config_dir"
+cp -n agents.example.json "$config_dir/agents.json"
 ```
 
+Edit that configuration with your SSH hosts, tmux sessions, and optional Teleport proxy, then run `codemux`.
+The example uses placeholder hosts and does not connect to a real deployment.
+
 The installer links `~/.local/bin/codemux` to this checkout. Keep the checkout in place;
-code changes take effect immediately, and the default `agents.json` stays beside the source.
+code changes take effect after restarting codemux. Agent configuration stays outside the checkout.
 You can run `codemux` from any directory.
 
 If `~/.local/bin` is not on your PATH, add this to your shell configuration:
@@ -26,9 +32,7 @@ If `~/.local/bin` is not on your PATH, add this to your shell configuration:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Create a local `agents.json` with your hosts and `codex` sessions.
-Keep connection details out of version control.
-Authenticate with Teleport before starting codemux:
+If you use Teleport, authenticate with your configured proxy before starting codemux:
 
 ```bash
 tsh login --proxy=teleport.example.com
@@ -63,6 +67,24 @@ If a shared connection drops, its forwards stop. Press `w` to recreate a forward
 The remote web server must already be running.
 Forwarding runs without terminal input; authenticate interactively first if SSH reports an authentication error.
 Codemux displays SSH errors but does not probe web servers.
+
+## Desktop notifications
+
+Codemux sends a desktop notification when an agent finishes, fails, is interrupted, awaits approval, or its Codex process stops.
+Notifications include the agent name, host, and a snippet of the latest response or progress message, limited to 240 characters.
+If the process exits, the notification uses its last observed response.
+
+Completed turns inside an active `/goal` loop stay quiet.
+A finished turn with a complete, blocked, paused, usage-limited, or budget-limited goal triggers a notification.
+Approval requests, failures, and interruptions notify even when the goal remains active.
+
+The first successful snapshot establishes a baseline without notifying. Repeated snapshots and reconnections do not repeat the same alert.
+Notifications continue while attached to tmux and stop when codemux exits.
+They depend on the three-second polling interval and the status reader's approval detection limits.
+Unknown or stale status does not count as an observed stop.
+
+Notification delivery runs in the background. Missing `notify-send` or delivery errors appear in the dashboard's message line.
+Your desktop's notification settings control whether banners appear.
 
 ## Shared connections
 
@@ -130,7 +152,8 @@ Sessions with multiple root Codex threads are reported as ambiguous rather than 
 
 ## Agent list
 
-Edit `agents.json` and restart codemux. Each entry has these fields:
+The default agent list is `$XDG_CONFIG_HOME/codemux/agents.json`, or `~/.config/codemux/agents.json` when that variable is unset or empty.
+Edit that file and restart codemux. Each entry has these fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -156,6 +179,8 @@ codemux --config /path/to/agents.json
 ```
 
 The list is configuration, not discovery. Codemux reads existing state; approvals and agent interaction remain inside the attached terminal.
+Only `agents.example.json` belongs in version control. Keep real hostnames and connection details in your user configuration or an external `--config` file.
+The repository ignores a root-level `agents.json` to prevent accidentally adding a local copy.
 
 ## Checks
 

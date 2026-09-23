@@ -139,7 +139,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             return process
 
         with patch.object(app.asyncio, "create_subprocess_exec", side_effect=local_process):
-            task = asyncio.create_task(app.watch_host(agents, observations, source, AsyncMock(command=AsyncMock(side_effect=lambda: ["ssh", "host"]))))
+            task = asyncio.create_task(app.watch_host(agents, observations, source, AsyncMock(command=AsyncMock(side_effect=lambda: ["ssh", "host"])), app.Notifications()))
             try:
                 await self.wait_until(lambda: all(value.turn == "active" for value in observations.values()))
                 self.assertEqual(len(spawned), 1)
@@ -160,7 +160,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             return await original(sys.executable, "-u", "-", **kwargs)
 
         with patch.object(app.asyncio, "create_subprocess_exec", side_effect=local_process):
-            task = asyncio.create_task(app.watch_host([agent], observations, source, AsyncMock(command=AsyncMock(side_effect=lambda: ["ssh", "host"]))))
+            task = asyncio.create_task(app.watch_host([agent], observations, source, AsyncMock(command=AsyncMock(side_effect=lambda: ["ssh", "host"])), app.Notifications()))
             try:
                 await self.wait_until(lambda: observations[agent].turn == "stale")
                 self.assertEqual(observations[agent].snapshot["response"]["text"], "Done")
