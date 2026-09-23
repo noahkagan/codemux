@@ -41,7 +41,7 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         for agent in self.agents:
             self.dashboard.observations[agent].update({
                 "turn": "finished", "goal": "blocked", "thread_id": agent.name,
-                "response": {"id": "reply", "text": ("A long response line\n" * 40), "completed_at": 100},
+                "response": {"id": "reply", "text": ("A long response line\n" * 40), "kind": "final", "timestamp": 100},
             })
 
     async def test_expand_all_from_partial_then_collapse_all(self):
@@ -91,6 +91,30 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         await self.dashboard.handle(ord("a"))
         self.assertEqual(self.dashboard.expanded, set())
         self.assertEqual(self.dashboard.port_input, "8000")
+
+    async def test_expanded_preview_refreshes_and_labels_cached_progress(self):
+        agent = self.agents[0]
+        observation = self.dashboard.observations[agent]
+        await self.dashboard.handle(ord(" "))
+        for text in ("Inspecting changes", "Running checks"):
+            observation.update({"turn": "active", "goal": None,
+                                "response": {"id": "progress", "kind": "progress", "text": text, "timestamp": 120}})
+            self.dashboard.draw()
+            preview = "\n".join(self.screen.lines.values())
+            self.assertIn(text, preview)
+            self.assertIn("Last progress message / 1970-01-01 00:02 UTC", preview)
+            self.assertNotIn("Last final response", preview)
+        observation.update({"error": "SSH disconnected"})
+        preview = "\n".join(self.dashboard.response_lines(agent, 80))
+        self.assertIn("Last cached progress message", preview)
+        self.assertIn("Running checks", preview)
+        observation.update({"turn": "finished", "goal": None,
+                            "response": {"id": "done", "kind": "final", "text": "Checks passed", "timestamp": 180}})
+        self.dashboard.draw()
+        preview = "\n".join(self.screen.lines.values())
+        self.assertIn("Last final response / 1970-01-01 00:03 UTC", preview)
+        self.assertIn("Checks passed", preview)
+        self.assertNotIn("Running checks", preview)
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):

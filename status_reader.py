@@ -10,6 +10,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 
 
@@ -74,25 +75,37 @@ def read_thread(home, thread_id):
         goal = goals.execute(
             "SELECT status FROM thread_goals WHERE thread_id=?", (thread_id,)).fetchone()
         turn = history.execute(
-            "SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",
+            "SELECT status, turn_id FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",
             (thread_id,)).fetchone()
         if turn and turn[0] not in TURN_LABELS:
             raise ValueError(f"Unsupported Codex turn state: {turn[0]}")
-        final = history.execute(
-            "SELECT turn_id, final_agent_item_id, completed_at FROM thread_turns "
-            "WHERE thread_id=? AND final_agent_item_id IS NOT NULL "
-            "ORDER BY rollout_ordinal DESC LIMIT 1", (thread_id,)).fetchone()
-        response = None
-        if final:
+        row = None
+        kind = "progress"
+        if turn and turn[0] == "inProgress":
             row = history.execute(
-                "SELECT item_json FROM thread_items WHERE thread_id=? AND turn_id=? AND item_id=?",
-                (thread_id, final[0], final[1])).fetchone()
-            if not row:
-                raise ValueError("Codex final response is missing from thread history")
-            item = json.loads(row[0])
+                "SELECT item_id, created_at_ms / 1000.0, item_json FROM thread_items "
+                "WHERE thread_id=? AND turn_id=? AND item_type='agentMessage' "
+                "ORDER BY rollout_ordinal DESC LIMIT 1", (thread_id, turn[1])).fetchone()
+        if row is None:
+            kind = "final"
+            final = history.execute(
+                "SELECT turn_id, final_agent_item_id, completed_at FROM thread_turns "
+                "WHERE thread_id=? AND final_agent_item_id IS NOT NULL "
+                "ORDER BY rollout_ordinal DESC LIMIT 1", (thread_id,)).fetchone()
+            if final:
+                row = history.execute(
+                    "SELECT item_id, ?, item_json FROM thread_items WHERE thread_id=? AND turn_id=? AND item_id=?",
+                    (final[2], thread_id, final[0], final[1])).fetchone()
+                if not row:
+                    raise ValueError("Codex final response is missing from thread history")
+        response = None
+        if row:
+            item = json.loads(row[2])
             if item.get("type") != "agentMessage" or not isinstance(item.get("text"), str):
-                raise ValueError("Unsupported Codex final response format")
-            response = {"id": final[1], "text": item["text"], "completed_at": final[2]}
+                raise ValueError("Unsupported Codex response format")
+            if item.get("phase") == "final_answer":
+                kind = "final"
+            response = {"id": row[0], "text": item["text"], "kind": kind, "timestamp": row[1]}
         return {
             "thread_id": thread_id,
             "turn": TURN_LABELS[turn[0]] if turn else "idle",
@@ -101,9 +114,13 @@ def read_thread(home, thread_id):
         }
 
 
+def codex_processes(pane_pids, inventory):
+    return [pid for pid, (_, name) in inventory.items()
+            if name == "codex" and belongs_to_pane(pid, pane_pids, inventory)]
+
+
 def read_session(pane_pids, inventory):
-    codex_pids = [pid for pid, (_, name) in inventory.items()
-                  if name == "codex" and belongs_to_pane(pid, pane_pids, inventory)]
+    codex_pids = codex_processes(pane_pids, inventory)
     if not codex_pids:
         return {"thread_id": None, "turn": "absent", "goal": None, "response": None}
     roots = set().union(*(root_threads(pid) for pid in codex_pids))
@@ -112,9 +129,17 @@ def read_session(pane_pids, inventory):
     return read_thread(*next(iter(roots)))
 
 
-async def snapshot(sessions):
+def approval_visible(screen):
+    # Match the current modal's controls, never approval text in scrollback.
+    lines = "\n".join(line.strip() for line in screen.splitlines() if line.strip())
+    return (lines.endswith("Press enter to confirm or esc to cancel")
+            and re.search(r"^(?:› )?\d+\. Yes, proceed \(y\)$", lines, re.MULTILINE) is not None
+            and re.search(r"^(?:› )?\d+\. No, and tell Codex what to do differently \(esc\)$", lines, re.MULTILINE) is not None)
+
+
+async def tmux(*arguments):
     process = await asyncio.create_subprocess_exec(
-        "tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}",
+        "tmux", *arguments,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         output, error = await asyncio.wait_for(process.communicate(), timeout=3)
@@ -124,18 +149,31 @@ async def snapshot(sessions):
         raise RuntimeError("tmux did not respond")
     if process.returncode:
         raise RuntimeError(error.decode(errors="replace").strip() or "tmux is unavailable")
+    return output.decode()
+
+
+async def snapshot(sessions):
+    output = await tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}\t#{pane_id}")
     panes = {}
-    for line in output.decode().splitlines():
-        session, pid = line.rsplit("\t", 1)
-        panes.setdefault(session, set()).add(int(pid))
+    for line in output.splitlines():
+        session, pid, pane_id = line.rsplit("\t", 2)
+        panes.setdefault(session, {})[int(pid)] = pane_id
     inventory = processes()
     result = {}
     for session in sessions:
         try:
             if session not in panes:
                 raise ValueError("tmux session not found")
-            result[session] = read_session(panes[session], inventory)
-        except (OSError, sqlite3.Error, ValueError) as error:
+            value = read_session(panes[session], inventory)
+            if value["turn"] == "active":
+                for pid, pane_id in panes[session].items():
+                    if codex_processes({pid}, inventory):
+                        screen = await tmux("capture-pane", "-p", "-J", "-t", pane_id)
+                        if approval_visible(screen):
+                            value["turn"] = "approval"
+                            break
+            result[session] = value
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
             result[session] = {"error": str(error)}
     return result
 

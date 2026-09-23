@@ -39,7 +39,7 @@ tsh login --proxy=teleport.example.com
 | Key | Action |
 | --- | --- |
 | Up / Down or k / j | Select an agent |
-| Space | Expand or collapse the selected agent's last final response |
+| Space | Expand or collapse the selected agent's progress or final response |
 | a | Expand all responses; collapse all when every response is expanded |
 | Page Up / Page Down | Scroll through expanded responses |
 | Enter | Attach to its remote tmux session, creating the session if absent |
@@ -89,17 +89,33 @@ It makes no model calls and uses no GPU resources.
 
 The table keeps turn and goal state separate:
 
-- Turn: `active`, `finished`, `interrupted`, `failed`, or `idle` before the first recorded turn.
+- Turn: `active`, `approval`, `finished`, `interrupted`, `failed`, or `idle` before the first recorded turn.
 - Goal: Codex's stored goal state, including `active`, `blocked`, `complete`, `paused`, `usage_limited`, or `budget_limited`.
 - `absent` means the tmux session contains no running Codex process.
 - `loading` means the first snapshot has not arrived. `unknown` means no usable snapshot is available.
 - `stale` means polling failed after an earlier successful snapshot. Cached responses remain available and are labeled as cached.
 
-An active turn can be waiting for approval or user input. This reader does not distinguish those cases.
+Rows use green for running turns, gray for finished or idle agents, red for failures, and cyan while loading.
+Yellow marks approval prompts, interrupted turns, unavailable status, and blocked, paused, or limited goals when the turn is not running.
+The selected row retains its color with a reversed background. Terminals without color retain the text labels.
+
+Codex's database keeps turns active while awaiting approval.
+For active turns, codemux also reads the visible tmux panes containing Codex and recognizes the standard approval dialog's controls.
+Recognized dialogs show `approval` in yellow; the next poll clears this label once the dialog disappears.
+This detection depends on Codex's terminal format and can miss clipped or different dialogs. Other user-input prompts can still appear as `active`.
+Codemux does not read scrollback or answer prompts. Enter attaches to tmux so you can review the request there.
 A finished turn does not mean its goal is complete or that no questions need attention.
 
-Space expands the last final response, preserving paragraphs and wrapping text to the terminal width.
-While a new turn runs, the previous final response remains visible with its completion time.
+The PROGRESS column follows HOST and uses the remaining terminal width for a single-line message preview.
+It shows current progress during active turns and the final response afterward. Long messages end with an ellipsis.
+HOST fits the configured hostnames when space allows; narrow terminals shorten names to keep status columns visible.
+Cached previews are marked `[cached]` when polling fails.
+
+Space expands the latest progress message during an active turn, preserving paragraphs and wrapping text to the terminal width.
+The preview updates every three seconds as Codex records messages, then shows the final response when the turn finishes.
+Until the current turn records a message, the previous final response remains visible.
+Labels distinguish progress from final responses and show the message creation or turn completion time, respectively.
+The preview excludes tool output and reasoning; it is not a live terminal feed.
 `a` toggles all responses; Page Up and Page Down scroll long responses. Enter continues to attach to tmux.
 The selected agent's full host and tmux session remain below the table.
 The WEB column shows the local forwarded port; the selected row's full URL appears below the table.

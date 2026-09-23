@@ -13,9 +13,29 @@ import socket
 import sys
 import textwrap
 import time
+import unicodedata
 from dataclasses import dataclass
 
 from ssh_transport import Connection, Connections, capture, stop_process
+
+
+def table_cell(text, width):
+    text = " ".join(text.split())
+    cells = [(char, 0 if unicodedata.combining(char) else
+              2 if unicodedata.east_asian_width(char) in ("W", "F") else 1)
+             for char in text if char.isprintable()]
+    truncated = sum(size for _, size in cells) > width
+    limit = width - 1 if truncated else width
+    result, used = [], 0
+    for char, size in cells:
+        if used + size > limit:
+            break
+        result.append(char)
+        used += size
+    if truncated:
+        result.append("…")
+        used += 1
+    return "".join(result) + " " * (width - used)
 
 
 @dataclass(frozen=True)
@@ -113,6 +133,7 @@ class Dashboard:
         self.agents = agents
         self.selected = 0
         self.forwards = {}
+        self.colors = {}
         self.observations = {agent: Observation() for agent in agents}
         self.expanded = set()
         self.top = 0
@@ -123,6 +144,41 @@ class Dashboard:
     @property
     def agent(self):
         return self.agents[self.selected]
+
+    def configure_colors(self):
+        if not curses.has_colors():
+            return
+        try:
+            curses.use_default_colors()
+            background = -1
+        except curses.error:
+            background = curses.COLOR_BLACK
+        palette = {
+            "running": curses.COLOR_GREEN,
+            "finished": 8 if curses.COLORS >= 16 else curses.COLOR_WHITE,
+            "attention": curses.COLOR_YELLOW,
+            "failed": curses.COLOR_RED,
+            "loading": curses.COLOR_CYAN,
+        }
+        for pair, (name, foreground) in enumerate(palette.items(), start=1):
+            curses.init_pair(pair, foreground, background)
+            self.colors[name] = curses.color_pair(pair)
+        if curses.COLORS < 16:
+            self.colors["finished"] |= curses.A_DIM
+
+    def row_style(self, observation):
+        if observation.turn == "failed":
+            name = "failed"
+        elif observation.turn == "active":
+            name = "running"
+        elif (observation.turn in ("approval", "interrupted", "stale", "unknown")
+              or observation.goal in ("blocked", "paused", "usage_limited", "budget_limited")):
+            name = "attention"
+        elif observation.turn == "loading":
+            name = "loading"
+        else:
+            name = "finished"
+        return self.colors.get(name, 0)
 
     def write(self, row, text, style=0):
         height, width = self.screen.getmaxyx()
@@ -141,12 +197,13 @@ class Dashboard:
         if observation.error:
             lines.append(f"Status unavailable: {observation.error}")
         if not response:
-            lines.append("No final response available.")
+            lines.append("No response available yet.")
         else:
-            label = "Last cached final response" if observation.error else "Last final response"
-            completed_at = response.get("completed_at")
-            if completed_at is not None:
-                label += " / " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(completed_at))
+            label = "progress message" if response["kind"] == "progress" else "final response"
+            label = ("Last cached " if observation.error else "Last ") + label
+            timestamp = response.get("timestamp")
+            if timestamp is not None:
+                label += " / " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(timestamp))
             lines.append(label)
             lines.extend(response["text"].splitlines())
         wrapped = []
@@ -157,24 +214,33 @@ class Dashboard:
         return wrapped
 
     def table_rows(self, width):
-        name_width = min(20, max(10, width // 6))
-        host_width = width - name_width - 42
+        # Reserve the marker, margins, separators, and TURN / GOAL / WEB columns.
+        available = width - 44
+        name_width = min(20, max(5, max(len(agent.name) for agent in self.agents)), available - 16)
+        host_width = min(max(4, max(len(agent.host) for agent in self.agents)), available - name_width - 8)
+        progress_width = available - name_width - host_width
 
-        def columns(name, host, turn, goal, web):
-            fields = zip((name, host, turn, goal, web), (name_width, host_width, 11, 14, 5))
-            return "  ".join(f"{value[:size]:<{size}}" for value, size in fields)
+        def columns(name, host, progress, turn, goal, web):
+            fields = zip((name, host, progress, turn, goal, web), (name_width, host_width, progress_width, 11, 14, 5))
+            return "  ".join(table_cell(value, size) for value, size in fields)
 
-        header = "   " + columns("AGENT", "HOST", "TURN", "GOAL", "WEB")
+        header = "   " + columns("AGENT", "HOST", "PROGRESS", "TURN", "GOAL", "WEB")
         rows, positions = [], []
         for agent in self.agents:
             positions.append(len(rows))
             observation = self.observations[agent]
+            response = observation.snapshot.get("response") if observation.snapshot else None
+            progress = response["text"] if response else "-"
+            if observation.error:
+                progress = "[cached] " + progress if response else observation.error
             forward = self.forwards.get(agent)
             marker = " v " if agent in self.expanded else " > "
+            style = self.row_style(observation)
+            if agent is self.agent:
+                style |= curses.A_REVERSE
             rows.append((marker + columns(
-                agent.name, agent.host, observation.turn, observation.goal,
-                str(forward.local_port) if forward else "-"),
-                curses.A_REVERSE if agent is self.agent else 0))
+                agent.name, agent.host, progress, observation.turn, observation.goal,
+                str(forward.local_port) if forward else "-"), style))
             if agent in self.expanded:
                 rows.extend((line, 0) for line in self.response_lines(agent, width))
         return header, rows, positions
@@ -320,6 +386,7 @@ class Dashboard:
 
     async def run(self):
         curses.curs_set(0)
+        self.configure_colors()
         self.screen.nodelay(True)
         self.screen.keypad(True)
         source = Path(__file__).resolve().with_name("status_reader.py").read_bytes()

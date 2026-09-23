@@ -23,7 +23,8 @@ class StatusReaderTests(unittest.TestCase):
                     thread_id TEXT, turn_id TEXT, rollout_ordinal INTEGER,
                     status TEXT, final_agent_item_id TEXT, completed_at INTEGER);
                 CREATE TABLE thread_items (
-                    thread_id TEXT, turn_id TEXT, item_id TEXT, item_json TEXT);
+                    thread_id TEXT, turn_id TEXT, item_id TEXT, item_json TEXT,
+                    rollout_ordinal INTEGER, created_at_ms INTEGER, item_type TEXT);
             """,
         }.items():
             with sqlite3.connect(self.home / name) as db:
@@ -34,20 +35,59 @@ class StatusReaderTests(unittest.TestCase):
             db.execute("INSERT INTO thread_goals VALUES ('root','blocked')")
         with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
             db.execute("INSERT INTO thread_turns VALUES ('root','first',1,'completed','reply',100)")
-            db.execute("INSERT INTO thread_items VALUES ('root','first','reply',?)", (
+            db.execute("INSERT INTO thread_items VALUES ('root','first','reply',?,1,99000,'agentMessage')", (
                 json.dumps({"type": "agentMessage", "phase": "final_answer", "text": "Last answer\nSecond line"}),))
 
-    def test_active_turn_keeps_previous_final_response_and_goal(self):
+    def test_active_turn_shows_latest_progress_without_changing_databases(self):
         with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
             db.execute("INSERT INTO thread_turns VALUES ('root','second',2,'inProgress',NULL,NULL)")
-            db.execute("INSERT INTO thread_items VALUES ('root','second','progress',?)", (
+            db.execute("INSERT INTO thread_items VALUES ('root','second','progress',?,3,200000,'agentMessage')", (
                 json.dumps({"type": "agentMessage", "phase": "commentary", "text": "Still working"}),))
+            # Insertion order, tool output, other turns, and subagents must not determine the preview.
+            for thread, turn, ordinal, item_type in [
+                ("root", "second", 2, "agentMessage"), ("root", "second", 4, "commandExecution"),
+                ("root", "second", 5, "reasoning"), ("child", "second", 6, "agentMessage"),
+                ("root", "first", 7, "agentMessage"),
+            ]:
+                db.execute("INSERT INTO thread_items VALUES (?,?,?, ?,?,210000,?)", (
+                    thread, turn, f"other-{ordinal}", json.dumps({"type": item_type, "text": "Do not show"}), ordinal, item_type))
         before = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in self.home.glob("*.sqlite")}
         value = reader.read_thread(self.home, "root")
         self.assertEqual(value["turn"], "active")
         self.assertEqual(value["goal"], "blocked")
-        self.assertEqual(value["response"]["text"], "Last answer\nSecond line")
+        self.assertEqual(value["response"], {"id": "progress", "text": "Still working", "kind": "progress", "timestamp": 200})
         self.assertEqual(before, {p.name: hashlib.sha256(p.read_bytes()).digest() for p in self.home.glob("*.sqlite")})
+
+    def test_preview_updates_then_switches_to_final_answer(self):
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("INSERT INTO thread_turns VALUES ('root','second',2,'inProgress',NULL,NULL)")
+        self.assertEqual(reader.read_thread(self.home, "root")["response"]["text"], "Last answer\nSecond line")
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("INSERT INTO thread_items VALUES ('root','second','progress',?,2,200000,'agentMessage')", (
+                json.dumps({"type": "agentMessage", "phase": "commentary", "text": "Working"}),))
+        self.assertEqual(reader.read_thread(self.home, "root")["response"]["text"], "Working")
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("UPDATE thread_items SET item_json=? WHERE item_id='progress'", (
+                json.dumps({"type": "agentMessage", "phase": "commentary", "text": "Working on tests"}),))
+        self.assertEqual(reader.read_thread(self.home, "root")["response"]["text"], "Working on tests")
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("INSERT INTO thread_items VALUES ('root','second','done',?,3,300000,'agentMessage')", (
+                json.dumps({"type": "agentMessage", "phase": "final_answer", "text": "Done"}),))
+        self.assertEqual(reader.read_thread(self.home, "root")["response"]["kind"], "final")
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("UPDATE thread_turns SET status='completed', final_agent_item_id='done', completed_at=301 WHERE turn_id='second'")
+        value = reader.read_thread(self.home, "root")
+        self.assertEqual(value["turn"], "finished")
+        self.assertEqual(value["response"], {"id": "done", "text": "Done", "kind": "final", "timestamp": 301})
+
+    def test_first_active_turn_without_messages_has_no_response(self):
+        with sqlite3.connect(self.home / "thread_history_1.sqlite") as db:
+            db.execute("DELETE FROM thread_turns")
+            db.execute("DELETE FROM thread_items")
+            db.execute("INSERT INTO thread_turns VALUES ('root','first',1,'inProgress',NULL,NULL)")
+        value = reader.read_thread(self.home, "root")
+        self.assertEqual(value["turn"], "active")
+        self.assertIsNone(value["response"])
 
     def test_finished_turn_and_absent_goal(self):
         with sqlite3.connect(self.home / "goals_1.sqlite") as db:
@@ -94,7 +134,7 @@ class StatusReaderTests(unittest.TestCase):
 class SnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_session_and_failed_reader_do_not_hide_other_session(self):
         process = unittest.mock.Mock(returncode=0)
-        process.communicate = unittest.mock.AsyncMock(return_value=(b"one\t10\ntwo\t20\n", b""))
+        process.communicate = unittest.mock.AsyncMock(return_value=(b"one\t10\t%0\ntwo\t20\t%1\n", b""))
         with patch.object(reader.asyncio, "create_subprocess_exec", return_value=process), \
              patch.object(reader, "processes", return_value={}), \
              patch.object(reader, "read_session", side_effect=[{"turn": "finished"}, sqlite3.OperationalError("schema changed")]):
