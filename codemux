@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""A terminal launcher for remote agent sessions and their web pages."""
+
+import argparse
+import asyncio
+import curses
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import socket
+import sys
+import textwrap
+import time
+from dataclasses import dataclass
+
+from ssh_transport import Connection, Connections, capture, stop_process
+
+
+@dataclass(frozen=True)
+class Agent:
+    name: str
+    host: str
+    session: str
+    proxy: str = ""
+    web_port: int = 8000
+
+
+@dataclass
+class Observation:
+    snapshot: dict | None = None
+    error: str | None = None
+
+    def update(self, snapshot):
+        self.error = snapshot.get("error")
+        if self.error is None:
+            self.snapshot = snapshot
+
+    @property
+    def turn(self):
+        if self.error:
+            return "stale" if self.snapshot else "unknown"
+        return self.snapshot["turn"] if self.snapshot else "loading"
+
+    @property
+    def goal(self):
+        return (self.snapshot.get("goal") or "-") if self.snapshot and not self.error else "-"
+
+
+async def watch_host(agents, observations, source, connection):
+    """One SSH stream per host; reconnect without discarding the last response."""
+    sessions = list(dict.fromkeys(item.session for item in agents))
+    while True:
+        process = None
+        diagnostics = None
+        try:
+            command = await connection.command()
+            command.append(shlex.join(["python3", "-u", "-", *sessions]))
+            process = await asyncio.create_subprocess_exec(
+                *command, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True, limit=1024 * 1024)
+            diagnostics = asyncio.create_task(process.stderr.read())
+            process.stdin.write(source)
+            await process.stdin.drain()
+            process.stdin.close()
+            while True:
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=15)
+                if not line:
+                    await asyncio.wait_for(process.wait(), timeout=3)
+                    error = (await diagnostics).decode(errors="replace").strip()
+                    raise RuntimeError(error.splitlines()[-1] if error else "SSH connection closed")
+                values = json.loads(line)
+                for item in agents:
+                    observations[item].update(values[item.session])
+        except asyncio.TimeoutError:
+            for item in agents:
+                observations[item].error = "Status reader did not respond within 15 seconds"
+        except (OSError, ValueError, KeyError, RuntimeError) as error:
+            for item in agents:
+                observations[item].error = str(error)
+        finally:
+            if process:
+                await stop_process(process)
+            if diagnostics:
+                await diagnostics
+        await asyncio.sleep(5)
+
+
+@dataclass
+class Forward:
+    process: asyncio.subprocess.Process
+    connection: Connection
+    local_port: int
+    remote_port: int
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.local_port}"
+
+    @property
+    def mapping(self):
+        return f"127.0.0.1:{self.local_port}:127.0.0.1:{self.remote_port}"
+
+    async def close(self):
+        await self.connection.cancel_forward(self.mapping, self.process)
+
+
+class Dashboard:
+    def __init__(self, screen, agents):
+        self.screen = screen
+        self.agents = agents
+        self.selected = 0
+        self.forwards = {}
+        self.observations = {agent: Observation() for agent in agents}
+        self.expanded = set()
+        self.top = 0
+        self.reveal_selection = True
+        self.port_input = None
+        self.message = "Select an agent. Enter attaches to its tmux session."
+
+    @property
+    def agent(self):
+        return self.agents[self.selected]
+
+    def write(self, row, text, style=0):
+        height, width = self.screen.getmaxyx()
+        if 0 <= row < height and width > 1:
+            text = "".join(char for char in text if char.isprintable())
+            try:
+                self.screen.addnstr(row, 0, text, width - 1, style)
+            except curses.error:
+                # Wide Unicode characters can reach the edge before the character limit.
+                pass
+
+    def response_lines(self, agent, width):
+        observation = self.observations[agent]
+        response = observation.snapshot.get("response") if observation.snapshot else None
+        lines = []
+        if observation.error:
+            lines.append(f"Status unavailable: {observation.error}")
+        if not response:
+            lines.append("No final response available.")
+        else:
+            label = "Last cached final response" if observation.error else "Last final response"
+            completed_at = response.get("completed_at")
+            if completed_at is not None:
+                label += " / " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(completed_at))
+            lines.append(label)
+            lines.extend(response["text"].splitlines())
+        wrapped = []
+        for line in lines:
+            line = "".join(char for char in line.expandtabs(4) if char.isprintable())
+            wrapped.extend("     " + part for part in
+                           (textwrap.wrap(line, width=max(1, width - 6)) or [""]))
+        return wrapped
+
+    def table_rows(self, width):
+        name_width = min(20, max(10, width // 6))
+        host_width = width - name_width - 42
+
+        def columns(name, host, turn, goal, web):
+            fields = zip((name, host, turn, goal, web), (name_width, host_width, 11, 14, 5))
+            return "  ".join(f"{value[:size]:<{size}}" for value, size in fields)
+
+        header = "   " + columns("AGENT", "HOST", "TURN", "GOAL", "WEB")
+        rows, positions = [], []
+        for agent in self.agents:
+            positions.append(len(rows))
+            observation = self.observations[agent]
+            forward = self.forwards.get(agent)
+            marker = " v " if agent in self.expanded else " > "
+            rows.append((marker + columns(
+                agent.name, agent.host, observation.turn, observation.goal,
+                str(forward.local_port) if forward else "-"),
+                curses.A_REVERSE if agent is self.agent else 0))
+            if agent in self.expanded:
+                rows.extend((line, 0) for line in self.response_lines(agent, width))
+        return header, rows, positions
+
+    def draw(self):
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        if height < 12 or width < 72:
+            self.write(0, "codemux: enlarge terminal to at least 72 x 12. q quits.")
+            self.screen.refresh()
+            return
+
+        self.write(0, f" CODEMUX  /  {len(self.agents)} agents", curses.A_BOLD)
+        header, rows, positions = self.table_rows(width)
+        self.write(2, header, curses.A_BOLD)
+        visible = height - 10
+        if self.reveal_selection:
+            selected_row = positions[self.selected]
+            if selected_row < self.top or selected_row >= self.top + visible:
+                self.top = selected_row
+            self.reveal_selection = False
+        self.top = max(0, min(self.top, len(rows) - visible))
+        for row, (text, style) in enumerate(rows[self.top:self.top + visible], start=3):
+            self.write(row, text.ljust(width - 1), style)
+
+        self.write(height - 6, f" {self.agent.name}  |  {self.agent.host}  |  tmux: {self.agent.session}")
+        forward = self.forwards.get(self.agent)
+        if forward:
+            self.write(height - 5, f" {forward.url} -> remote 127.0.0.1:{forward.remote_port}")
+        else:
+            self.write(height - 5, " Web forwarding is off. Press w to choose a remote port.")
+        prompt = (f" Remote HTTP port: {self.port_input}_  [Enter enable / Esc cancel]"
+                  if self.port_input is not None else f" {self.message}")
+        self.write(height - 3, prompt, curses.A_BOLD)
+        self.write(height - 2, " Space response  a expand/collapse all  PgUp/PgDn scroll")
+        self.write(height - 1, " j/k move  Enter attach  w forward  o browser  x stop  q quit")
+        self.screen.refresh()
+
+    async def attach(self):
+        agent = self.agent
+        command = await self.connections[agent].command("-t")
+        command += [
+            shlex.join(["tmux", "new-session", "-A", "-s", agent.session]),
+        ]
+        curses.def_prog_mode()
+        curses.endwin()
+        previous_sigint = signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            print(f"Attaching to {agent.name}. Detach with Ctrl-b, then d to return.", flush=True)
+            process = await asyncio.create_subprocess_exec(
+                *command, env={**os.environ, "TERM": "xterm-256color"})
+            code = await process.wait()
+            self.message = (f"Returned from {agent.name}." if code == 0
+                            else f"SSH exited with code {code}. Press Enter to retry.")
+            if code != 0:
+                await asyncio.to_thread(input, "Press Enter to return to codemux...")
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            curses.reset_prog_mode()
+            self.screen.clearok(True)
+            self.screen.nodelay(True)
+
+    async def start_forward(self, remote_port):
+        agent = self.agent
+        # Let the OS pick an unused controller port. SSH reports a bind failure
+        # if another process takes it before the forwarding process starts.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            local_port = listener.getsockname()[1]
+        mapping = f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"
+        connection = self.connections[agent]
+        command = await connection.command("-O", "forward", "-L", mapping)
+        await capture(command)
+        self.forwards[agent] = Forward(connection.process, connection, local_port, remote_port)
+        self.message = f"Forward enabled for {agent.name}. Press o to open its web page."
+
+    def collect_exits(self):
+        for agent, forward in list(self.forwards.items()):
+            if forward.process.returncode is not None:
+                self.message = f"{agent.name}: SSH disconnected; web forwarding stopped. Press w to restart."
+                del self.forwards[agent]
+
+    async def handle(self, key):
+        if self.port_input is not None:
+            if key == 27:
+                self.port_input = None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                self.port_input = self.port_input[:-1]
+            elif ord("0") <= key <= ord("9") and len(self.port_input) < 5:
+                self.port_input += chr(key)
+            elif key in (10, 13, curses.KEY_ENTER):
+                port = int(self.port_input or "0")
+                self.port_input = None
+                if 1 <= port <= 65535:
+                    await self.start_forward(port)
+                else:
+                    self.message = "Port must be between 1 and 65535. Press w to retry."
+            return True
+
+        if key in (ord("q"), 27):
+            return False
+        if key in (ord("j"), curses.KEY_DOWN):
+            self.selected = min(self.selected + 1, len(self.agents) - 1)
+            self.reveal_selection = True
+        elif key in (ord("k"), curses.KEY_UP):
+            self.selected = max(0, self.selected - 1)
+            self.reveal_selection = True
+        elif key == ord(" "):
+            self.expanded.symmetric_difference_update({self.agent})
+            self.reveal_selection = True
+        elif key == ord("a"):
+            self.expanded = set() if len(self.expanded) == len(self.agents) else set(self.agents)
+            self.reveal_selection = True
+        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            page = max(1, self.screen.getmaxyx()[0] - 10)
+            self.top += page if key == curses.KEY_NPAGE else -page
+            self.reveal_selection = False
+        elif key in (10, 13, curses.KEY_ENTER):
+            await self.attach()
+        elif key == ord("w"):
+            if self.agent in self.forwards:
+                self.message = "Forward already exists. Press o to open it, or x to stop it."
+            else:
+                self.port_input = str(self.agent.web_port)
+        elif key == ord("x"):
+            forward = self.forwards.get(self.agent)
+            if forward:
+                await forward.close()
+                del self.forwards[self.agent]
+            self.message = f"Web forwarding off for {self.agent.name}."
+        elif key == ord("o"):
+            forward = self.forwards.get(self.agent)
+            if not forward:
+                self.message = "Press w to enable web forwarding first."
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    "xdg-open", forward.url, stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                code = await process.wait()
+                self.message = (f"Opened {forward.url}" if code == 0
+                                else f"Browser launch failed. Open {forward.url} manually.")
+        return True
+
+    async def run(self):
+        curses.curs_set(0)
+        self.screen.nodelay(True)
+        self.screen.keypad(True)
+        source = Path(__file__).resolve().with_name("status_reader.py").read_bytes()
+        async with Connections(self.agents) as self.connections:
+            hosts = {}
+            for agent in self.agents:
+                hosts.setdefault((agent.host, agent.proxy), []).append(agent)
+            readers = [asyncio.create_task(watch_host(group, self.observations, source, self.connections[group[0]]))
+                       for group in hosts.values()]
+            try:
+                while True:
+                    self.collect_exits()
+                    self.draw()
+                    key = self.screen.getch()
+                    if key != -1:
+                        try:
+                            if not await self.handle(key):
+                                break
+                        except asyncio.TimeoutError:
+                            self.message = "SSH did not respond within 15 seconds."
+                        except (OSError, RuntimeError) as error:
+                            self.message = str(error)
+                    await asyncio.sleep(0.05)
+            finally:
+                for reader in readers:
+                    reader.cancel()
+                await asyncio.gather(*readers, return_exceptions=True)
+                await asyncio.gather(*(forward.close() for forward in self.forwards.values()), return_exceptions=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).resolve().with_name("agents.json"),
+                        help="agent list (default: agents.json beside this script)")
+    args = parser.parse_args()
+    try:
+        entries = json.loads(args.config.read_text())
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("config must contain a nonempty list of agents")
+        agents = [Agent(**entry) for entry in entries]
+        for agent in agents:
+            if not all(isinstance(value, str) and value and not value.startswith("-")
+                       for value in (agent.name, agent.host, agent.session)):
+                raise ValueError("each agent needs a name, host, and tmux session")
+            if not isinstance(agent.proxy, str):
+                raise ValueError("proxy must be a string")
+            if type(agent.web_port) is not int or not 1 <= agent.web_port <= 65535:
+                raise ValueError("web_port must be an integer between 1 and 65535")
+        if len(set(agents)) != len(agents):
+            raise ValueError("config contains duplicate agents")
+    except (OSError, ValueError, TypeError) as error:
+        parser.error(str(error))
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        parser.error("run codemux in an interactive terminal")
+    try:
+        curses.wrapper(lambda screen: asyncio.run(Dashboard(screen, agents).run()))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
