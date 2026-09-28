@@ -2,8 +2,15 @@
 
 import asyncio
 from pathlib import Path
+import re
 import shlex
 import tempfile
+
+
+def diagnostic(error, fallback):
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", error.decode(errors="replace"))
+    lines = text.strip().splitlines()
+    return lines[-1] if lines else fallback
 
 
 async def stop_process(process):
@@ -26,8 +33,7 @@ async def capture(command):
     try:
         output, error = await asyncio.wait_for(process.communicate(), timeout=15)
         if process.returncode:
-            lines = error.decode(errors="replace").strip().splitlines()
-            raise RuntimeError(lines[-1] if lines else f"{Path(command[0]).name} exited with code {process.returncode}")
+            raise RuntimeError(diagnostic(error, f"{Path(command[0]).name} exited with code {process.returncode}"))
         return output
     finally:
         await stop_process(process)
@@ -87,8 +93,7 @@ class Connection:
     async def wait_ready(self):
         while True:
             if self.process.returncode is not None:
-                lines = (await self.diagnostics).decode(errors="replace").strip().splitlines()
-                raise RuntimeError(lines[-1] if lines else "SSH connection closed")
+                raise RuntimeError(diagnostic(await self.diagnostics, "SSH connection closed"))
             if self.socket_path.exists():
                 return
             await asyncio.sleep(0.05)

@@ -38,6 +38,9 @@ If you use Teleport, authenticate with your configured proxy before starting cod
 tsh login --proxy=teleport.example.com
 ```
 
+If the Teleport certificate expires, run that login command again in another terminal.
+The dashboard shows the command for your configured proxy and retries SSH connections every five seconds.
+
 ## Controls
 
 | Key | Action |
@@ -45,6 +48,7 @@ tsh login --proxy=teleport.example.com
 | Up / Down or k / j | Select an agent |
 | Space | Expand or collapse the selected agent's progress or final response |
 | a | Expand all responses; collapse all when every response is expanded |
+| n | Edit the selected agent's note; Enter saves, Esc cancels, Ctrl-U clears |
 | Page Up / Page Down | Scroll through expanded responses |
 | Enter | Attach to its remote tmux session, creating the session if absent |
 | Ctrl-b, then d | Detach from tmux and return to the dashboard |
@@ -142,6 +146,12 @@ The preview excludes tool output and reasoning; it is not a live terminal feed.
 The selected agent's full host and tmux session remain below the table.
 The WEB column shows the local forwarded port; the selected row's full URL appears below the table.
 
+Manual notes appear beneath agent rows, including when responses are collapsed.
+Press `n` to edit a note. Type to append, Backspace to delete, or Ctrl-U to clear the text.
+Enter saves; saving an empty note removes it. Esc cancels the edit.
+Notes persist in the agent configuration, including when using `--config`, and are never sent to remote agents.
+Long notes are shortened in the table; press `n` to edit them.
+
 Status polling continues while attached to tmux. SSH failures retry after five seconds; missing snapshots time out after fifteen seconds.
 Restart codemux after changing configuration. It needs a terminal at least 72 columns wide and 12 rows high.
 
@@ -162,6 +172,7 @@ Edit that file and restart codemux. Each entry has these fields:
 | `session` | Remote tmux session name |
 | `proxy` | Optional Teleport proxy; omit to use ordinary OpenSSH |
 | `web_port` | Suggested remote HTTP port; defaults to 8000 and can be changed with `w` |
+| `note` | Optional manual annotation; edit with `n` in the dashboard |
 
 Multiple entries can use one host with different tmux sessions.
 For plain SSH, connection settings come from `~/.ssh/config`:
@@ -189,3 +200,7 @@ Run the local tests without contacting remote hosts:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+Licensed under the [Zero-Clause BSD license (0BSD)](LICENSE). No attribution is required.

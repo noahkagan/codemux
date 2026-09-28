@@ -11,13 +11,14 @@ import shlex
 import signal
 import socket
 import sys
+import tempfile
 import textwrap
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from notifications import Notifications
-from ssh_transport import Connection, Connections, capture, stop_process
+from ssh_transport import Connection, Connections, capture, diagnostic, stop_process
 
 
 def table_cell(text, width):
@@ -46,6 +47,27 @@ class Agent:
     session: str
     proxy: str = ""
     web_port: int = 8000
+    note: str = field(default="", compare=False)
+
+
+def save_note(path, agent, note):
+    path = path.resolve()
+    entries = json.loads(path.read_text())
+    entry = next((entry for entry in entries if Agent(**entry) == agent), None)
+    if entry is None:
+        raise ValueError("Agent configuration changed; restart codemux before editing its note.")
+    if note:
+        entry["note"] = note
+    else:
+        entry.pop("note", None)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(json.dumps(entries, indent=2, ensure_ascii=False) + "\n")
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -90,8 +112,7 @@ async def watch_host(agents, observations, source, connection, notifications):
                 line = await asyncio.wait_for(process.stdout.readline(), timeout=15)
                 if not line:
                     await asyncio.wait_for(process.wait(), timeout=3)
-                    error = (await diagnostics).decode(errors="replace").strip()
-                    raise RuntimeError(error.splitlines()[-1] if error else "SSH connection closed")
+                    raise RuntimeError(diagnostic(await diagnostics, "SSH connection closed"))
                 values = json.loads(line)
                 for item in agents:
                     observations[item].update(values[item.session])
@@ -100,8 +121,12 @@ async def watch_host(agents, observations, source, connection, notifications):
             for item in agents:
                 observations[item].error = "Status reader did not respond within 15 seconds"
         except (OSError, ValueError, KeyError, RuntimeError) as error:
+            message = str(error)
+            if agents[0].proxy and any(text in message.lower() for text in ("cert has expired", "profile expired")):
+                login = shlex.join(["tsh", "login", f"--proxy={agents[0].proxy}"])
+                message = f"Teleport login expired. Run: {login}"
             for item in agents:
-                observations[item].error = str(error)
+                observations[item].error = message
         finally:
             if process:
                 await stop_process(process)
@@ -130,9 +155,10 @@ class Forward:
 
 
 class Dashboard:
-    def __init__(self, screen, agents):
+    def __init__(self, screen, agents, config_path=None):
         self.screen = screen
         self.agents = agents
+        self.config_path = config_path
         self.selected = 0
         self.forwards = {}
         self.colors = {}
@@ -141,6 +167,7 @@ class Dashboard:
         self.top = 0
         self.reveal_selection = True
         self.port_input = None
+        self.note_input = None
         self.message = "Select an agent. Enter attaches to its tmux session."
 
     @property
@@ -243,6 +270,8 @@ class Dashboard:
             rows.append((marker + columns(
                 agent.name, agent.host, progress, observation.turn, observation.goal,
                 str(forward.local_port) if forward else "-"), style))
+            if agent.note:
+                rows.append(("     Note: " + table_cell(agent.note, width - 12), curses.A_BOLD))
             if agent in self.expanded:
                 rows.extend((line, 0) for line in self.response_lines(agent, width))
         return header, rows, positions
@@ -276,8 +305,11 @@ class Dashboard:
             self.write(height - 5, " Web forwarding is off. Press w to choose a remote port.")
         prompt = (f" Remote HTTP port: {self.port_input}_  [Enter enable / Esc cancel]"
                   if self.port_input is not None else f" {self.message}")
+        if self.note_input is not None:
+            prompt = f" Note: {self.note_input[-(width - 10):]}_"
+            self.write(height - 4, f" {self.message}")
         self.write(height - 3, prompt, curses.A_BOLD)
-        self.write(height - 2, " Space response  a expand/collapse all  PgUp/PgDn scroll")
+        self.write(height - 2, " Space response  a expand/collapse all  PgUp/PgDn scroll  n note")
         self.write(height - 1, " j/k move  Enter attach  w forward  o browser  x stop  q quit")
         self.screen.refresh()
 
@@ -326,6 +358,32 @@ class Dashboard:
                 del self.forwards[agent]
 
     async def handle(self, key):
+        character = key if isinstance(key, str) else ""
+        key = ord(key) if character else key
+        if self.note_input is not None:
+            if character and character.isprintable():
+                self.note_input += character
+            elif key == 27:
+                self.note_input = None
+                self.message = "Note edit canceled."
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                self.note_input = self.note_input[:-1]
+            elif key == 21:
+                self.note_input = ""
+            elif key in (10, 13, curses.KEY_ENTER):
+                note = self.note_input.strip()
+                try:
+                    await asyncio.to_thread(save_note, self.config_path, self.agent, note)
+                except (OSError, ValueError, TypeError) as error:
+                    self.message = f"Note not saved: {error}"
+                    return True
+                else:
+                    self.agents[self.selected] = replace(self.agent, note=note)
+                    self.message = "Note saved." if note else "Note cleared."
+                self.note_input = None
+                self.reveal_selection = True
+            return True
+
         if self.port_input is not None:
             if key == 27:
                 self.port_input = None
@@ -362,6 +420,9 @@ class Dashboard:
             self.reveal_selection = False
         elif key in (10, 13, curses.KEY_ENTER):
             await self.attach()
+        elif key == ord("n"):
+            self.note_input = self.agent.note
+            self.message = "Enter save / Esc cancel / Ctrl-U clear / Backspace delete"
         elif key == ord("w"):
             if self.agent in self.forwards:
                 self.message = "Forward already exists. Press o to open it, or x to stop it."
@@ -407,7 +468,10 @@ class Dashboard:
                         self.message = notifications.error
                         notifications.error = None
                     self.draw()
-                    key = self.screen.getch()
+                    try:
+                        key = self.screen.get_wch()
+                    except curses.error:
+                        key = -1
                     if key != -1:
                         try:
                             if not await self.handle(key):
@@ -442,6 +506,8 @@ def main():
                 raise ValueError("each agent needs a name, host, and tmux session")
             if not isinstance(agent.proxy, str):
                 raise ValueError("proxy must be a string")
+            if not isinstance(agent.note, str):
+                raise ValueError("note must be a string")
             if type(agent.web_port) is not int or not 1 <= agent.web_port <= 65535:
                 raise ValueError("web_port must be an integer between 1 and 65535")
         if len(set(agents)) != len(agents):
@@ -451,7 +517,7 @@ def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("run codemux in an interactive terminal")
     try:
-        curses.wrapper(lambda screen: asyncio.run(Dashboard(screen, agents).run()))
+        curses.wrapper(lambda screen: asyncio.run(Dashboard(screen, agents, args.config).run()))
     except KeyboardInterrupt:
         pass
 

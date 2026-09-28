@@ -56,11 +56,20 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_master_failure_reports_diagnostic(self):
         async def failed_master(*command, **kwargs):
             return await self.original_spawn(
-                sys.executable, "-c", "import sys; sys.stderr.write('certificate expired'); sys.exit(1)", **kwargs)
+                sys.executable, "-c", "import sys; sys.stderr.write('\\x1b[31mERROR: \\x1b[0mssh: cert has expired\\n'); sys.exit(1)", **kwargs)
 
         with patch.object(ssh.asyncio, "create_subprocess_exec", side_effect=failed_master):
-            with self.assertRaisesRegex(RuntimeError, "certificate expired"):
+            with self.assertRaisesRegex(RuntimeError, "^ERROR: ssh: cert has expired$"):
                 await self.connection.command()
+        with patch.object(ssh.asyncio, "create_subprocess_exec", side_effect=self.fake_master):
+            command = await self.connection.command()
+            self.assertEqual(command[-1], "user@host")
+            self.assertIsNone(self.connection.process.returncode)
+
+    async def test_capture_strips_ansi_diagnostics(self):
+        with self.assertRaisesRegex(RuntimeError, "^ERROR: Active profile expired.$"):
+            await ssh.capture([sys.executable, "-c",
+                               "import sys; sys.stderr.write('\\x1b[31mERROR: \\x1b[0mActive profile expired.\\n'); sys.exit(1)"])
 
     async def test_cancel_during_startup_terminates_master(self):
         async def stalled_master(*command, **kwargs):

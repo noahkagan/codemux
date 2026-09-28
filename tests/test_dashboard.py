@@ -118,6 +118,19 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_certificate_shows_proxy_login_command(self):
+        agent = app.Agent("one", "host", "codex", proxy="teleport.example.com")
+        observations = {agent: app.Observation()}
+        connection = AsyncMock(command=AsyncMock(side_effect=RuntimeError("ERROR: ssh: cert has expired")))
+        task = asyncio.create_task(app.watch_host([agent], observations, b"", connection, app.Notifications()))
+        try:
+            await self.wait_until(lambda: observations[agent].error is not None)
+            self.assertEqual(observations[agent].error,
+                             "Teleport login expired. Run: tsh login --proxy=teleport.example.com")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def wait_until(self, predicate):
         async def wait():
             while not predicate():
