@@ -1,4 +1,4 @@
-"""Read Codex 0.154 SQLite state without changing sessions or configuration.
+"""Read Codex SQLite state without changing sessions or configuration.
 
 The controller sends this file over SSH and runs it in memory on each host.
 Only JSON snapshots go to stdout. No files are installed on the remote host.
@@ -52,6 +52,7 @@ def belongs_to_pane(pid, pane_pids, inventory):
 
 def root_threads(pid):
     homes = {}
+    rollouts = set()
     for fd in (PROC / str(pid) / "fd").iterdir():
         try:
             path = Path(os.readlink(fd))
@@ -59,13 +60,21 @@ def root_threads(pid):
             continue
         if path.parent.name == "thread-writer-locks" and path.suffix == ".lock":
             homes.setdefault(path.parent.parent, set()).add(path.stem)
+        elif path.name == "state_5.sqlite":
+            homes.setdefault(path.parent, set())
+        elif path.name.startswith("rollout-") and path.suffix == ".jsonl":
+            rollouts.add(str(path))
     roots = set()
     for home, ids in homes.items():
         with database(home / "state_5.sqlite") as state:
-            for thread_id in ids:
-                row = state.execute("SELECT source FROM threads WHERE id=?", (thread_id,)).fetchone()
-                if row and row[0] == "cli":
-                    roots.add((home, thread_id))
+            selectors = [("id", value) for value in ids]
+            selectors.extend(("rollout_path", value) for value in rollouts)
+            for column, value in selectors:
+                row = state.execute(
+                    f"SELECT id, source FROM threads WHERE {column}=?", (value,)).fetchone()
+                # Resuming an editor-created thread in the CLI retains its source.
+                if row and row[1] in {"cli", "vscode"}:
+                    roots.add((home, row[0]))
     return roots
 
 

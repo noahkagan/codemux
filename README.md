@@ -155,7 +155,9 @@ Long notes are shortened in the table; press `n` to edit them.
 Status polling continues while attached to tmux. SSH failures retry after five seconds; missing snapshots time out after fifteen seconds.
 Restart codemux after changing configuration. It needs a terminal at least 72 columns wide and 12 rows high.
 
-The reader uses internal database schemas verified with Codex CLI `0.154.0`.
+The reader maps open thread locks or rollout logs to SQLite records, including
+editor-created threads resumed in the CLI. It uses internal database schemas
+verified with Codex CLI `0.154.0` and `0.159.3`.
 Codex upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
 Each configured tmux session must contain exactly one root Codex thread. Subagents are excluded.
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.

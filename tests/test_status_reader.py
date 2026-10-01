@@ -120,6 +120,26 @@ class StatusReaderTests(unittest.TestCase):
             value = reader.read_session({10}, inventory)
         self.assertEqual(value["thread_id"], "root")
 
+    def test_resumed_editor_thread_maps_from_open_rollout_without_lock(self):
+        proc = self.home / "proc"
+        fds = proc / "20" / "fd"
+        fds.mkdir(parents=True)
+        rollout = self.home / "sessions" / "rollout-root.jsonl"
+        child = self.home / "sessions" / "rollout-child.jsonl"
+        with sqlite3.connect(self.home / "state_5.sqlite") as db:
+            db.execute("ALTER TABLE threads ADD COLUMN rollout_path TEXT")
+            db.execute("UPDATE threads SET source='vscode', rollout_path=? WHERE id='root'", (str(rollout),))
+            db.execute("UPDATE threads SET rollout_path=? WHERE id='child'", (str(child),))
+        (fds / "1").symlink_to(self.home / "state_5.sqlite")
+        (fds / "2").symlink_to(rollout)
+        (fds / "3").symlink_to(child)
+        inventory = {10: (1, "bash"), 20: (10, "codex")}
+        with patch.object(reader, "PROC", proc):
+            self.assertEqual(reader.read_session({10}, inventory)["thread_id"], "root")
+            (fds / "2").unlink()
+            with self.assertRaisesRegex(ValueError, "found 0"):
+                reader.read_session({10}, inventory)
+
     def test_multiple_root_threads_are_reported_as_ambiguous(self):
         inventory = {10: (1, "bash"), 20: (10, "codex"), 21: (10, "codex")}
         with patch.object(reader, "root_threads", side_effect=[{(self.home, "root")}, {(self.home, "other")} ]):
