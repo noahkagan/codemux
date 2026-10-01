@@ -5,11 +5,16 @@ Select an agent, attach to its tmux session, or forward a web server to your bro
 
 ## Install and run
 
-Requires Linux, Python 3.10+, and OpenSSH `ssh` on the controller.
+Requires Linux, Python 3.10+ with `curses` support, and OpenSSH `ssh` on the controller.
 Teleport hosts also require `tsh`.
 The remote hosts need Linux, Python 3.10+, `tmux`, and Codex. Browser launching uses `xdg-open`.
 Desktop notifications use `notify-send` and the controller's desktop notification service.
 There are no Python packages to install.
+
+The installer checks that `python3 -c 'import curses'` succeeds before creating the launcher.
+For Python built from source, including pyenv installations, install the ncurses development headers before building or rebuilding Python.
+On Ubuntu/Debian, the package is `libncurses-dev` (`sudo apt-get install libncurses-dev`).
+Installing the headers alone does not add curses support to an existing Python build.
 
 ```bash
 cd ~/codemux
