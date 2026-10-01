@@ -7,7 +7,7 @@ Select an agent, attach to its tmux session, or forward a web server to your bro
 
 Requires Linux, Python 3.10+ with `curses` support, and OpenSSH `ssh` on the controller.
 Teleport hosts also require `tsh`.
-The remote hosts need Linux, Python 3.10+, `tmux`, and Codex. Browser launching uses `xdg-open`.
+The remote hosts need Linux, Python 3.10+ with `sqlite3` support, `tmux`, and Codex. Browser launching uses `xdg-open`.
 Desktop notifications use `notify-send` and the controller's desktop notification service.
 There are no Python packages to install.
 
