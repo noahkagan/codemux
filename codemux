@@ -332,7 +332,8 @@ class Dashboard:
         with self.terminal():
             print(f"Attaching to {agent.name}. Detach with Ctrl-b, then d to return.", flush=True)
             command = await self.connections[agent].command("-t", interactive=True)
-            command.append(shlex.join(["tmux", "new-session", "-A", "-s", agent.session]))
+            remote_command = shlex.join(["exec", "tmux", "new-session", "-A", "-s", agent.session])
+            command.append('exec "$SHELL" -lc ' + shlex.quote(remote_command))
             process = await asyncio.create_subprocess_exec(
                 *command, env={**os.environ, "TERM": "xterm-256color"})
             code = await process.wait()

@@ -63,6 +63,7 @@ The dashboard shows the command for your configured proxy and retries SSH connec
 | q / Esc | Quit and stop status readers and forwards |
 
 Attachment fills the current terminal. Detaching preserves the remote processes.
+Attachment runs tmux through the remote user's login shell so its PATH settings apply.
 An absent tmux session starts a shell; run your agent there yourself.
 If you changed tmux's prefix, use your configured detach binding.
 
@@ -172,8 +173,8 @@ Each configured tmux session must contain exactly one root Codex thread. Subagen
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.
 
 macOS status collection is not supported yet: process ancestry and open-file discovery currently use Linux `/proc`.
-Remote commands also require `tmux` and Python 3.10+ on the noninteractive SSH PATH.
-If your Mac requires a login-shell wrapper to find them, password authentication alone will not make attachment or status collection work.
+Status collection also requires `tmux` and Python 3.10+ on the noninteractive SSH PATH.
+Attachment uses the login-shell PATH, but this does not enable macOS status collection.
 
 ## Agent list
 

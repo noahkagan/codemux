@@ -3,6 +3,7 @@ import curses
 import importlib.machinery
 import importlib.util
 import json
+import shlex
 from pathlib import Path
 import sys
 import unittest
@@ -119,7 +120,7 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_attachment_restores_dashboard_after_authentication(self):
-        agent = app.Agent("one", "host", "codex")
+        agent = app.Agent("one", "host", "codex work; $(exit 9)")
         for error in (None, RuntimeError("Authentication canceled")):
             with self.subTest(error=error):
                 screen = Mock()
@@ -148,7 +149,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                         spawn.assert_not_called()
                     else:
                         await dashboard.attach()
-                        self.assertEqual(spawn.call_args.args[-1], "tmux new-session -A -s codex")
+                        remote = shlex.split(spawn.call_args.args[-1])
+                        self.assertEqual(remote[:3], ["exec", "$SHELL", "-lc"])
+                        self.assertEqual(shlex.split(remote[3]),
+                                         ["exec", "tmux", "new-session", "-A", "-s", agent.session])
                     connection.command.assert_awaited_once_with("-t", interactive=True)
                     restore.assert_called_once()
                     screen.clearok.assert_called_once_with(True)
