@@ -190,11 +190,23 @@ For plain SSH, connection settings come from `~/.ssh/config`:
 ]
 ```
 
-To use another agent list:
+To select another agent list in the same configuration directory, use a profile:
+
+```bash
+codemux --profile work
+```
+
+This loads `work.json` beside the default `agents.json`. Profile names must be nonempty and cannot contain `/`.
+The file must already exist; a missing profile reports an error. Notes save to the selected profile's file.
+Without `--profile`, codemux continues to load `agents.json`.
+
+To use an agent list at another path:
 
 ```bash
 codemux --config /path/to/agents.json
 ```
+
+`--profile` and `--config` cannot be used together.
 
 The list is configuration, not discovery. Codemux reads existing state; approvals and agent interaction remain inside the attached terminal.
 Only `agents.example.json` belongs in version control. Keep real hostnames and connection details in your user configuration or an external `--config` file.

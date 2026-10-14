@@ -491,12 +491,17 @@ class Dashboard:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    parser.add_argument("--config", type=Path,
-                        default=config_home / "codemux" / "agents.json",
-                        help="agent list (default: $XDG_CONFIG_HOME/codemux/agents.json or ~/.config/codemux/agents.json)")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--config", type=Path,
+                        help="path to an agent list")
+    source.add_argument("--profile", default="agents", metavar="NAME",
+                        help="load NAME.json from $XDG_CONFIG_HOME/codemux or ~/.config/codemux (default: agents)")
     args = parser.parse_args()
+    if not args.profile or "/" in args.profile:
+        parser.error("profile must be a nonempty name without slashes; use --config for paths")
+    config_path = args.config if args.config is not None else config_home / "codemux" / f"{args.profile}.json"
     try:
-        entries = json.loads(args.config.read_text())
+        entries = json.loads(config_path.read_text())
         if not isinstance(entries, list) or not entries:
             raise ValueError("config must contain a nonempty list of agents")
         agents = [Agent(**entry) for entry in entries]
@@ -517,7 +522,7 @@ def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("run codemux in an interactive terminal")
     try:
-        curses.wrapper(lambda screen: asyncio.run(Dashboard(screen, agents, args.config).run()))
+        curses.wrapper(lambda screen: asyncio.run(Dashboard(screen, agents, config_path).run()))
     except KeyboardInterrupt:
         pass
 
