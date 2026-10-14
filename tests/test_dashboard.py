@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 loader = importlib.machinery.SourceFileLoader("codemux_app", str(Path(__file__).resolve().parents[1] / "codemux"))
@@ -118,6 +118,61 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attachment_restores_dashboard_after_authentication(self):
+        agent = app.Agent("one", "host", "codex")
+        for error in (None, RuntimeError("Authentication canceled")):
+            with self.subTest(error=error):
+                screen = Mock()
+                dashboard = app.Dashboard(screen, [agent])
+                connection = AsyncMock()
+                dashboard.connections = {agent: connection}
+
+                async def command(*options, **kwargs):
+                    endwin.assert_called_once()
+                    restore.assert_not_called()
+                    if error:
+                        raise error
+                    return ["ssh", "host"]
+
+                connection.command.side_effect = command
+                process = AsyncMock()
+                process.wait.return_value = 0
+                with patch.object(app.curses, "def_prog_mode"), \
+                     patch.object(app.curses, "endwin") as endwin, \
+                     patch.object(app.curses, "reset_prog_mode") as restore, \
+                     patch.object(app.signal, "signal"), patch("builtins.print"), \
+                     patch.object(app.asyncio, "create_subprocess_exec", return_value=process) as spawn:
+                    if error:
+                        with self.assertRaisesRegex(RuntimeError, "Authentication canceled"):
+                            await dashboard.attach()
+                        spawn.assert_not_called()
+                    else:
+                        await dashboard.attach()
+                        self.assertEqual(spawn.call_args.args[-1], "tmux new-session -A -s codex")
+                    connection.command.assert_awaited_once_with("-t", interactive=True)
+                    restore.assert_called_once()
+                    screen.clearok.assert_called_once_with(True)
+                    screen.nodelay.assert_called_once_with(True)
+
+    async def test_forward_authenticates_and_tracks_connection_lifetime(self):
+        agent = app.Agent("one", "host", "codex")
+        dashboard = app.Dashboard(Mock(), [agent])
+        connection = AsyncMock()
+        connection.master = asyncio.get_running_loop().create_future()
+        connection.forward.return_value = connection.master
+        dashboard.connections = {agent: connection}
+        with patch.object(dashboard, "terminal"):
+            await dashboard.start_forward(8000)
+        forward = dashboard.forwards[agent]
+        connection.forward.assert_awaited_once_with(forward.mapping, interactive=True)
+        await forward.close()
+        connection.cancel_forward.assert_awaited_once_with(forward.mapping, connection.master)
+        dashboard.collect_exits()
+        self.assertIn(agent, dashboard.forwards)
+        connection.master.set_result(None)
+        dashboard.collect_exits()
+        self.assertNotIn(agent, dashboard.forwards)
+
     async def test_expired_certificate_shows_proxy_login_command(self):
         agent = app.Agent("one", "host", "codex", proxy="teleport.example.com")
         observations = {agent: app.Observation()}

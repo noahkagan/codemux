@@ -57,15 +57,14 @@ class Connection:
         self.host = host
         self.socket_path = socket_path
         self.config = config
-        self.process = None
-        self.diagnostics = None
+        self.master = None
         self.lock = asyncio.Lock()
         self.base = []
         self.target = host
 
-    async def command(self, *options):
+    async def command(self, *options, interactive=False):
         async with self.lock:
-            if self.process is None or self.process.returncode is not None:
+            if self.master is None or self.master.done():
                 await self.close()
                 self.base = ["ssh", "-S", str(self.socket_path),
                              "-o", "ControlMaster=no", "-o", "ControlPersist=no",
@@ -77,37 +76,68 @@ class Connection:
                     self.base += ["-F", str(path)]
                     self.target = self.host if self.host.endswith("." + cluster) else self.host + "." + cluster
                 self.socket_path.unlink(missing_ok=True)
-                self.process = await asyncio.create_subprocess_exec(
-                    *self.base, "-M", "-N", self.target,
-                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=True)
-                self.diagnostics = asyncio.create_task(self.process.stderr.read())
-                try:
-                    await asyncio.wait_for(self.wait_ready(), timeout=15)
-                except BaseException:
-                    await self.close()
-                    raise
+                # OpenSSH reads passwords from the controlling terminal, then
+                # detaches after authentication. Never pass credentials through Python.
+                with tempfile.TemporaryFile() as errors:
+                    process = await asyncio.create_subprocess_exec(
+                        "ssh", "-o", f"BatchMode={'no' if interactive else 'yes'}",
+                        "-f", *self.base[1:], "-M", "-N", self.target,
+                        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                        stderr=None if interactive else errors, start_new_session=not interactive)
+                    try:
+                        if interactive:
+                            code = await process.wait()
+                        else:
+                            code = await asyncio.wait_for(process.wait(), timeout=15)
+                        if code:
+                            errors.seek(0)
+                            raise RuntimeError(diagnostic(errors.read(), f"SSH authentication failed or canceled (exit {code})"))
+                        await capture(self.base + ["-O", "check", self.target])
+                    except BaseException:
+                        await stop_process(process)
+                        await self.stop_master()
+                        raise
+                self.master = asyncio.create_task(self.monitor())
         # If the master disappears, fail instead of opening an unshared connection.
         return self.base + ["-o", "ProxyCommand=false"] + list(options) + [self.target]
 
-    async def wait_ready(self):
-        while True:
-            if self.process.returncode is not None:
-                raise RuntimeError(diagnostic(await self.diagnostics, "SSH connection closed"))
-            if self.socket_path.exists():
-                return
-            await asyncio.sleep(0.05)
+    async def monitor(self):
+        try:
+            while True:
+                await asyncio.sleep(1)
+                await capture(self.base + ["-O", "check", self.target])
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            pass
+        finally:
+            await self.stop_master()
+
+    async def stop_master(self):
+        if self.socket_path.exists():
+            try:
+                await capture(self.base + ["-O", "exit", self.target])
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                pass
 
     async def cancel_forward(self, mapping, owner):
         # Never reconnect just to cancel a forward belonging to a dead master.
-        if owner is self.process and owner.returncode is None:
-            await capture(self.base + ["-O", "cancel", "-L", mapping, self.target])
+        async with self.lock:
+            if owner is self.master and not owner.done():
+                await capture(self.base + ["-O", "cancel", "-L", mapping, self.target])
+
+    async def forward(self, mapping, *, interactive=False):
+        await self.command(interactive=interactive)
+        async with self.lock:
+            if self.master.done():
+                raise RuntimeError("SSH disconnected; retry forwarding")
+            await capture(self.base + ["-O", "forward", "-L", mapping, self.target])
+            return self.master
 
     async def close(self):
-        if self.process:
-            await stop_process(self.process)
-        if self.diagnostics:
-            await self.diagnostics
+        if self.master:
+            self.master.cancel()
+            await asyncio.gather(self.master, return_exceptions=True)
+            # A newly created monitor may be canceled before entering its finally.
+            await self.stop_master()
 
 
 class Connections:

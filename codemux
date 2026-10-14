@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import curses
 import json
 import os
@@ -18,7 +19,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 
 from notifications import Notifications
-from ssh_transport import Connection, Connections, capture, diagnostic, stop_process
+from ssh_transport import Connection, Connections, diagnostic, stop_process
 
 
 def table_cell(text, width):
@@ -137,7 +138,7 @@ async def watch_host(agents, observations, source, connection, notifications):
 
 @dataclass
 class Forward:
-    process: asyncio.subprocess.Process
+    master: asyncio.Task
     connection: Connection
     local_port: int
     remote_port: int
@@ -151,7 +152,7 @@ class Forward:
         return f"127.0.0.1:{self.local_port}:127.0.0.1:{self.remote_port}"
 
     async def close(self):
-        await self.connection.cancel_forward(self.mapping, self.process)
+        await self.connection.cancel_forward(self.mapping, self.master)
 
 
 class Dashboard:
@@ -313,17 +314,25 @@ class Dashboard:
         self.write(height - 1, " j/k move  Enter attach  w forward  o browser  x stop  q quit")
         self.screen.refresh()
 
-    async def attach(self):
-        agent = self.agent
-        command = await self.connections[agent].command("-t")
-        command += [
-            shlex.join(["tmux", "new-session", "-A", "-s", agent.session]),
-        ]
+    @contextmanager
+    def terminal(self):
         curses.def_prog_mode()
         curses.endwin()
         previous_sigint = signal.signal(signal.SIGINT, lambda *_: None)
         try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            curses.reset_prog_mode()
+            self.screen.clearok(True)
+            self.screen.nodelay(True)
+
+    async def attach(self):
+        agent = self.agent
+        with self.terminal():
             print(f"Attaching to {agent.name}. Detach with Ctrl-b, then d to return.", flush=True)
+            command = await self.connections[agent].command("-t", interactive=True)
+            command.append(shlex.join(["tmux", "new-session", "-A", "-s", agent.session]))
             process = await asyncio.create_subprocess_exec(
                 *command, env={**os.environ, "TERM": "xterm-256color"})
             code = await process.wait()
@@ -331,11 +340,6 @@ class Dashboard:
                             else f"SSH exited with code {code}. Press Enter to retry.")
             if code != 0:
                 await asyncio.to_thread(input, "Press Enter to return to codemux...")
-        finally:
-            signal.signal(signal.SIGINT, previous_sigint)
-            curses.reset_prog_mode()
-            self.screen.clearok(True)
-            self.screen.nodelay(True)
 
     async def start_forward(self, remote_port):
         agent = self.agent
@@ -346,14 +350,14 @@ class Dashboard:
             local_port = listener.getsockname()[1]
         mapping = f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}"
         connection = self.connections[agent]
-        command = await connection.command("-O", "forward", "-L", mapping)
-        await capture(command)
-        self.forwards[agent] = Forward(connection.process, connection, local_port, remote_port)
+        with self.terminal():
+            master = await connection.forward(mapping, interactive=True)
+        self.forwards[agent] = Forward(master, connection, local_port, remote_port)
         self.message = f"Forward enabled for {agent.name}. Press o to open its web page."
 
     def collect_exits(self):
         for agent, forward in list(self.forwards.items()):
-            if forward.process.returncode is not None:
+            if forward.master.done():
                 self.message = f"{agent.name}: SSH disconnected; web forwarding stopped. Press w to restart."
                 del self.forwards[agent]
 

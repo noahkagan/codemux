@@ -74,7 +74,7 @@ Quitting codemux closes its forwards and shared SSH connections, leaving remote 
 If a shared connection drops, its forwards stop. Press `w` to recreate a forward after reconnection.
 
 The remote web server must already be running.
-Forwarding runs without terminal input; authenticate interactively first if SSH reports an authentication error.
+Starting a forward prompts for SSH authentication when a shared connection is not already available.
 Codemux displays SSH errors but does not probe web servers.
 
 ## Desktop notifications
@@ -106,7 +106,11 @@ For Teleport, codemux generates a temporary OpenSSH configuration with `tsh conf
 The generated cluster suffix is added to hostnames automatically; existing agent entries need no changes.
 Codemux expects one cluster in that generated configuration.
 Plain SSH hosts continue to use your SSH configuration.
-Connections authenticate without prompts; log in with `tsh login` or prepare your SSH credentials before starting codemux.
+Background status polling authenticates without prompts. If SSH needs a password, press Enter to authenticate and attach.
+Starting a web forward with `w` also permits authentication. OpenSSH handles passwords, key passphrases, and host-key confirmation in the terminal.
+Codemux does not read or store passwords. Authentication stays available through the shared connection after you detach.
+Canceling authentication with Ctrl-C returns to the dashboard. A dropped connection may require authenticating again with Enter or `w`.
+For Teleport, continue to log in with `tsh login` before connecting.
 
 Configuration and control sockets live in a private temporary directory for each codemux instance.
 Your SSH configuration is not modified. Quitting closes the connections and removes the temporary directory.
@@ -166,6 +170,10 @@ verified with Codex CLI `0.154.0` and `0.159.3`.
 Codex upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
 Each configured tmux session must contain exactly one root Codex thread. Subagents are excluded.
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.
+
+macOS status collection is not supported yet: process ancestry and open-file discovery currently use Linux `/proc`.
+Remote commands also require `tmux` and Python 3.10+ on the noninteractive SSH PATH.
+If your Mac requires a login-shell wrapper to find them, password authentication alone will not make attachment or status collection work.
 
 ## Agent list
 
