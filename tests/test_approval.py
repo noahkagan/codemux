@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import status_reader as reader
 from test_dashboard import app, Screen
@@ -46,11 +46,11 @@ class ApprovalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         pane_list = "codex\t20\t%1\ncodex\t10\t%0\n"
         tmux = AsyncMock(side_effect=[pane_list, APPROVAL, pane_list, "Working (esc to interrupt)", pane_list])
         with patch.object(reader, "tmux", tmux), patch.object(reader, "processes", return_value=inventory), \
-             patch.dict(reader.SESSIONS, {"codex": Mock(side_effect=[
+             patch.object(reader, "read_session", side_effect=[
                  {"turn": "active", "response": {"text": "Starting viewer"}},
                  {"turn": "active", "response": {"text": "Starting viewer"}},
                  {"turn": "finished", "response": {"text": "Done"}},
-             ])}):
+             ]):
             value = (await reader.snapshot({"codex": "codex"}))["codex"]
             self.assertEqual(value["turn"], "approval")
             self.assertEqual(value["response"]["text"], "Starting viewer")
@@ -63,7 +63,7 @@ class ApprovalSnapshotTests(unittest.IsolatedAsyncioTestCase):
         tmux = AsyncMock(side_effect=["one\t10\t%0\ntwo\t20\t%1\n", RuntimeError("pane disappeared")])
         inventory = {10: (1, "bash"), 11: (10, "codex")}
         with patch.object(reader, "tmux", tmux), patch.object(reader, "processes", return_value=inventory), \
-             patch.dict(reader.SESSIONS, {"codex": Mock(side_effect=[{"turn": "active"}, {"turn": "finished"}])}):
+             patch.object(reader, "read_session", side_effect=[{"turn": "active"}, {"turn": "finished"}]):
             values = await reader.snapshot({"one": "codex", "two": "codex"})
         self.assertEqual(values["one"], {"error": "pane disappeared"})
         self.assertEqual(values["two"]["turn"], "finished")

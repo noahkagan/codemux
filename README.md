@@ -119,15 +119,14 @@ A dropped connection interrupts its active terminal and forwards; status polling
 
 ## Turn, goal, and response
 
-Every three seconds, a reader maps configured tmux sessions to their agent sessions and reads local state:
-Codex SQLite databases, or the tail of Claude Code's JSONL transcript.
+Every three seconds, a reader maps configured tmux sessions to their agent sessions and reads local agent state.
 The reader runs from stdin, installs no files, and opens state read-only.
 It makes no model calls and uses no GPU resources.
 
 The table keeps turn and goal state separate:
 
 - Turn: `active`, `approval`, `finished`, `interrupted`, `failed`, or `idle` before the first recorded turn.
-- Goal: Codex's stored goal state; always `-` for Claude Code, including `active`, `blocked`, `complete`, `paused`, `usage_limited`, or `budget_limited`.
+- Goal: Codex's stored goal state, including `active`, `blocked`, `complete`, `paused`, `usage_limited`, or `budget_limited`; `-` for Claude Code.
 - `absent` means the tmux session contains no running agent process.
 - `loading` means the first snapshot has not arrived. `unknown` means no usable snapshot is available.
 - `stale` means polling failed after an earlier successful snapshot. Cached responses remain available and are labeled as cached.
@@ -138,7 +137,6 @@ The selected row retains its color with a reversed background. Terminals without
 
 Both agents keep turns active while awaiting approval.
 For active turns, codemux also reads the visible tmux panes containing the agent and recognizes its standard approval dialog's controls.
-For Claude Code, the dialog is a footer starting with `Esc to cancel` above numbered `Yes` and `No` options.
 Recognized dialogs show `approval` in yellow; the next poll clears this label once the dialog disappears.
 This detection depends on each agent's terminal format and can miss clipped or different dialogs. Other user-input prompts can still appear as `active`.
 Codemux does not read scrollback or answer prompts. Enter attaches to tmux so you can review the request there.
@@ -170,17 +168,11 @@ Restart codemux after changing configuration. It needs a terminal at least 72 co
 For Codex, the reader maps open thread locks or rollout logs to SQLite records, including
 editor-created threads resumed in the CLI. It uses internal database schemas
 verified with Codex CLI `0.154.0` and `0.159.3`.
-Codex upgrades can require reader changes.
-
-For Claude Code, the reader maps the `claude` process to its session through the open `/tmp/claude-<uid>/.../<session-id>/tasks` directory,
-then reads the last 1 MiB of `~/.claude/projects/*/<session-id>.jsonl`. It was verified with Claude Code `2.1.302`.
-A turn is active from a user prompt until a `turn_duration` record. An `[Request interrupted` record before it marks the turn interrupted.
-Progress is the latest assistant text of the turn. Claude Code has no failed-turn record, so `failed` never appears.
-A session with no transcript yet is `idle`. Each tmux session must contain exactly one `claude` process.
-
-Claude Code and Codex upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
+Codex and Claude Code upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
 Each configured Codex tmux session must contain exactly one root Codex thread. Subagents are excluded.
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.
+For Claude Code, the reader was verified with `2.1.302`. Claude Code records no failed turns, so `failed` never appears.
+A session with no transcript yet is `idle`. Each tmux session must contain exactly one `claude` process.
 
 macOS status collection is not supported yet: process ancestry and open-file discovery currently use Linux `/proc`.
 Status collection also requires `tmux` and Python 3.10+ on the noninteractive SSH PATH.

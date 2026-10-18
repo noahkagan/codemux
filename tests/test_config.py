@@ -94,14 +94,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
             self.assertIn("missing.json", stderr.getvalue())
 
-    def test_agent_defaults_to_codex_and_accepts_claude(self):
+    def test_agent_defaults_to_codex_and_rejects_unknown_agents(self):
         self.assertEqual(app.Agent(**self.entry).agent, "codex")
-        self.entry["agent"] = "claude"
-        path = self.root / "claude.json"
-        self.write_config(path)
-        self.run_app(["--config", str(path)])
-
-    def test_unknown_agent_is_rejected(self):
         self.entry["agent"] = "gemini"
         path = self.root / "agents.json"
         self.write_config(path)

@@ -17,9 +17,9 @@ def tool_result():
     return user([{"type": "tool_result", "content": "ok"}])
 
 
-def assistant(text, stop_reason, uuid="a", second=1):
+def assistant(text, uuid="a", second=1):
     return {"type": "assistant", "uuid": uuid, "timestamp": f"2026-10-18T06:00:0{second}.000Z",
-            "message": {"stop_reason": stop_reason, "content": [{"type": "text", "text": text}]}}
+            "message": {"content": [{"type": "text", "text": text}]}}
 
 
 def tool_use():
@@ -50,38 +50,35 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(self.read(), {"thread_id": SESSION, "turn_id": None, "turn": "idle", "goal": None, "response": None})
 
     def test_active_turn_shows_latest_progress_text(self):
-        value = self.read(user("go"), assistant("Looking", "tool_use"), tool_use(), tool_result())
+        value = self.read(user("go"), assistant("Looking"), tool_use(), tool_result())
         self.assertEqual(value["turn"], "active")
         self.assertEqual(value["response"]["text"], "Looking")
         self.assertEqual(value["response"]["kind"], "progress")
         self.assertEqual(value["response"]["timestamp"], 1792303201.0)
 
     def test_new_prompt_keeps_previous_final_response_until_new_text(self):
-        value = self.read(user("one"), assistant("Answer", "end_turn"), DONE, user("two"))
+        value = self.read(user("one"), assistant("Answer"), DONE, user("two"))
         self.assertEqual((value["turn"], value["response"]["text"], value["response"]["kind"]), ("active", "Answer", "final"))
-        value = self.read(user("one"), assistant("Answer", "end_turn"), DONE, user("two"), assistant("Working", "tool_use"))
+        value = self.read(user("one"), assistant("Answer"), DONE, user("two"), assistant("Working"))
         self.assertEqual((value["response"]["text"], value["response"]["kind"]), ("Working", "progress"))
 
     def test_turn_duration_finishes_with_final_response(self):
-        value = self.read(user("go"), assistant("Done", "end_turn"), DONE)
+        value = self.read(user("go"), assistant("Done"), DONE)
         self.assertEqual((value["turn"], value["response"]["kind"]), ("finished", "final"))
 
     def test_interrupt_marker_before_turn_duration_is_interrupted(self):
         value = self.read(user("go"), tool_use(), tool_result(),
                           user([{"type": "text", "text": "[Request interrupted by user for tool use]"}]), DONE)
         self.assertEqual(value["turn"], "interrupted")
-        self.assertEqual(self.read(*[user("go"), DONE, user("again"), assistant("Ok", "end_turn"), DONE])["turn"], "finished")
+        self.assertEqual(self.read(*[user("go"), DONE, user("again"), assistant("Ok"), DONE])["turn"], "finished")
 
-    def test_sidechain_and_meta_rows_are_ignored(self):
-        value = self.read(user("go"), assistant("Done", "end_turn"), DONE,
-                          user("caveat", isMeta=True), {**assistant("Subagent", "end_turn"), "isSidechain": True})
+    def test_meta_rows_are_ignored(self):
+        value = self.read(user("go"), assistant("Done"), DONE, user("caveat", isMeta=True))
         self.assertEqual((value["turn"], value["response"]["text"]), ("finished", "Done"))
 
-    def test_only_the_tail_of_a_large_transcript_is_read(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(reader, "TRANSCRIPT_TAIL", 600):
-            path = Path(directory) / f"{SESSION}.jsonl"
-            path.write_text("".join(json.dumps(row) + "\n" for row in [assistant("x" * 700, "end_turn"), user("go"), assistant("Tail", "end_turn"), DONE]))
-            self.assertEqual(reader.read_transcript(path, SESSION)["response"]["text"], "Tail")
+    def test_large_transcript_reports_its_latest_turn(self):
+        value = self.read(assistant("x" * 2_000_000), user("go"), assistant("Tail"), DONE)
+        self.assertEqual((value["turn"], value["response"]["text"]), ("finished", "Tail"))
 
 
 class SessionTests(unittest.TestCase):
@@ -108,16 +105,12 @@ class SessionTests(unittest.TestCase):
         value = reader.claude_session({10}, self.inventory)
         self.assertEqual((value["thread_id"], value["turn"]), (SESSION, "active"))
 
-    def test_session_without_transcript_is_idle(self):
-        self.open_tasks()
-        self.assertEqual(reader.claude_session({10}, self.inventory)["turn"], "idle")
-
     def test_unmappable_process_is_reported(self):
         with self.assertRaisesRegex(ValueError, "not visible"):
             reader.claude_session({10}, self.inventory)
 
     def test_no_claude_process_is_absent(self):
-        self.assertEqual(reader.claude_session({10}, {10: (1, "bash"), 30: (1, "claude")}), reader.ABSENT)
+        self.assertEqual(reader.claude_session({10}, {10: (1, "bash"), 30: (1, "claude")})["turn"], "absent")
 
     def test_multiple_processes_are_ambiguous(self):
         with self.assertRaisesRegex(ValueError, "found 2"):

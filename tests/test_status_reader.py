@@ -157,7 +157,7 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         process.communicate = unittest.mock.AsyncMock(return_value=(b"one\t10\t%0\ntwo\t20\t%1\n", b""))
         with patch.object(reader.asyncio, "create_subprocess_exec", return_value=process), \
              patch.object(reader, "processes", return_value={}), \
-             patch.dict(reader.SESSIONS, {"codex": unittest.mock.Mock(side_effect=[{"turn": "finished"}, sqlite3.OperationalError("schema changed")])}):
+             patch.object(reader, "read_session", side_effect=[{"turn": "finished"}, sqlite3.OperationalError("schema changed")]):
             values = await reader.snapshot({"one": "codex", "two": "codex", "missing": "codex"})
         self.assertEqual(values["one"]["turn"], "finished")
         self.assertIn("schema changed", values["two"]["error"])

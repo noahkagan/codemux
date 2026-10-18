@@ -144,18 +144,6 @@ def codex_session(pane_pids, inventory):
     return read_thread(*next(iter(roots)))
 
 
-def claude_transcript(pid):
-    # Claude holds its session's tasks directory open; no transcript file stays open.
-    for fd in (PROC / str(pid) / "fd").iterdir():
-        try:
-            match = CLAUDE_TASKS.search(os.readlink(fd))
-        except OSError:
-            continue
-        if match:
-            return next(CLAUDE_HOME.glob(f"projects/*/{match[1]}.jsonl"), None), match[1]
-    raise ValueError("Claude session is not visible in the process's open files")
-
-
 def read_transcript(path, session_id):
     with path.open("rb") as file:
         size = file.seek(0, os.SEEK_END)
@@ -163,34 +151,29 @@ def read_transcript(path, session_id):
         lines = file.read().splitlines()
     if size > TRANSCRIPT_TAIL:
         lines = lines[1:]
-    turn, interrupted, text, final = "idle", False, None, None
+    turn, interrupted, text = "idle", False, None
     for line in lines:
         row = json.loads(line)
-        if row.get("isSidechain") or row.get("isMeta"):
+        if row.get("isMeta"):
             continue
         if row["type"] == "user":
             content = row["message"]["content"]
             blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
             if blocks and all(block.get("type") == "tool_result" for block in blocks):
                 continue
-            if any(str(block.get("text", "")).startswith("[Request interrupted") for block in blocks):
-                interrupted = True
-            else:
-                text, final, interrupted = None, text or final, False
+            interrupted = any(str(block.get("text", "")).startswith("[Request interrupted") for block in blocks)
             turn = "active"
         elif row["type"] == "assistant":
             turn = "active"
             for block in row["message"]["content"]:
                 if block.get("type") == "text" and block["text"].strip():
-                    text = {"id": row["uuid"], "text": block["text"], "kind": "final" if row["message"].get("stop_reason") == "end_turn" else "progress",
+                    text = {"id": row["uuid"], "text": block["text"], "kind": "progress",
                             "timestamp": datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp()}
         elif row["type"] == "system" and row.get("subtype") == "turn_duration":
             turn = "interrupted" if interrupted else "finished"
-    if turn != "active" and text:
-        text["kind"] = "final"
-    elif turn == "active" and not text and final:
-        final["kind"] = "final"
-    return {"thread_id": session_id, "turn_id": None, "turn": turn, "goal": None, "response": text or final}
+            if text:
+                text["kind"] = "final"
+    return {"thread_id": session_id, "turn_id": None, "turn": turn, "goal": None, "response": text}
 
 
 def claude_session(pane_pids, inventory):
@@ -199,10 +182,18 @@ def claude_session(pane_pids, inventory):
         return ABSENT
     if len(claude_pids) != 1:
         raise ValueError(f"Expected one Claude process in this tmux session; found {len(claude_pids)}")
-    path, session_id = claude_transcript(claude_pids[0])
-    if path is None:
-        return {**ABSENT, "thread_id": session_id, "turn": "idle"}
-    return read_transcript(path, session_id)
+    # Claude holds its session's tasks directory open; no transcript file stays open.
+    for fd in (PROC / str(claude_pids[0]) / "fd").iterdir():
+        try:
+            match = CLAUDE_TASKS.search(os.readlink(fd))
+        except OSError:
+            continue
+        if match:
+            path = next(CLAUDE_HOME.glob(f"projects/*/{match[1]}.jsonl"), None)
+            if path is None:
+                return {**ABSENT, "thread_id": match[1], "turn": "idle"}
+            return read_transcript(path, match[1])
+    raise ValueError("Claude session is not visible in the process's open files")
 
 
 def approval_visible(screen):
@@ -222,7 +213,10 @@ def claude_approval_visible(screen):
             and re.search(r"^(?:❯ )?\d+\. No\b", text, re.MULTILINE) is not None)
 
 
-SESSIONS = {"codex": codex_session, "claude": claude_session}
+def read_session(kind, pane_pids, inventory):
+    return {"codex": codex_session, "claude": claude_session}[kind](pane_pids, inventory)
+
+
 APPROVALS = {"codex": approval_visible, "claude": claude_approval_visible}
 
 
@@ -253,7 +247,7 @@ async def snapshot(agents):
         try:
             if session not in panes:
                 raise ValueError("tmux session not found")
-            value = SESSIONS[kind](panes[session], inventory)
+            value = read_session(kind, panes[session], inventory)
             if value["turn"] == "active":
                 for pid, pane_id in panes[session].items():
                     if agent_processes(kind, {pid}, inventory):
@@ -284,4 +278,4 @@ if __name__ == "__main__":
     parser.add_argument("--once", action="store_true")
     parser.add_argument("agents", nargs="+", metavar="KIND:SESSION")
     args = parser.parse_args()
-    asyncio.run(run(dict(reversed(item.split(":", 1)) for item in args.agents), args.once))
+    asyncio.run(run({session: kind for kind, session in (item.split(":", 1) for item in args.agents)}, args.once))
