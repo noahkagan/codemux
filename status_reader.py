@@ -1,4 +1,4 @@
-"""Read Codex SQLite state without changing sessions or configuration.
+"""Read Codex SQLite state and Claude transcripts without changing sessions or configuration.
 
 The controller sends this file over SSH and runs it in memory on each host.
 Only JSON snapshots go to stdout. No files are installed on the remote host.
@@ -7,6 +7,7 @@ Only JSON snapshots go to stdout. No files are installed on the remote host.
 import argparse
 import asyncio
 from contextlib import closing
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,10 @@ TURN_LABELS = {
     "interrupted": "interrupted",
     "failed": "failed",
 }
+ABSENT = {"thread_id": None, "turn_id": None, "turn": "absent", "goal": None, "response": None}
+CLAUDE_HOME = Path.home() / ".claude"
+TRANSCRIPT_TAIL = 1024 * 1024
+CLAUDE_TASKS = re.compile(r"/claude-\d+/[^/]+/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})/tasks$")
 
 
 def database(path):
@@ -124,19 +129,80 @@ def read_thread(home, thread_id):
         }
 
 
-def codex_processes(pane_pids, inventory):
+def agent_processes(kind, pane_pids, inventory):
     return [pid for pid, (_, name) in inventory.items()
-            if name == "codex" and belongs_to_pane(pid, pane_pids, inventory)]
+            if name == kind and belongs_to_pane(pid, pane_pids, inventory)]
 
 
-def read_session(pane_pids, inventory):
-    codex_pids = codex_processes(pane_pids, inventory)
+def codex_session(pane_pids, inventory):
+    codex_pids = agent_processes("codex", pane_pids, inventory)
     if not codex_pids:
-        return {"thread_id": None, "turn_id": None, "turn": "absent", "goal": None, "response": None}
+        return ABSENT
     roots = set().union(*(root_threads(pid) for pid in codex_pids))
     if len(roots) != 1:
         raise ValueError(f"Expected one root Codex thread in this tmux session; found {len(roots)}")
     return read_thread(*next(iter(roots)))
+
+
+def claude_transcript(pid):
+    # Claude holds its session's tasks directory open; no transcript file stays open.
+    for fd in (PROC / str(pid) / "fd").iterdir():
+        try:
+            match = CLAUDE_TASKS.search(os.readlink(fd))
+        except OSError:
+            continue
+        if match:
+            return next(CLAUDE_HOME.glob(f"projects/*/{match[1]}.jsonl"), None), match[1]
+    raise ValueError("Claude session is not visible in the process's open files")
+
+
+def read_transcript(path, session_id):
+    with path.open("rb") as file:
+        size = file.seek(0, os.SEEK_END)
+        file.seek(max(0, size - TRANSCRIPT_TAIL))
+        lines = file.read().splitlines()
+    if size > TRANSCRIPT_TAIL:
+        lines = lines[1:]
+    turn, interrupted, text, final = "idle", False, None, None
+    for line in lines:
+        row = json.loads(line)
+        if row.get("isSidechain") or row.get("isMeta"):
+            continue
+        if row["type"] == "user":
+            content = row["message"]["content"]
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+            if blocks and all(block.get("type") == "tool_result" for block in blocks):
+                continue
+            if any(str(block.get("text", "")).startswith("[Request interrupted") for block in blocks):
+                interrupted = True
+            else:
+                text, final, interrupted = None, text or final, False
+            turn = "active"
+        elif row["type"] == "assistant":
+            turn = "active"
+            for block in row["message"]["content"]:
+                if block.get("type") == "text" and block["text"].strip():
+                    text = {"id": row["uuid"], "text": block["text"], "kind": "final" if row["message"].get("stop_reason") == "end_turn" else "progress",
+                            "timestamp": datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp()}
+        elif row["type"] == "system" and row.get("subtype") == "turn_duration":
+            turn = "interrupted" if interrupted else "finished"
+    if turn != "active" and text:
+        text["kind"] = "final"
+    elif turn == "active" and not text and final:
+        final["kind"] = "final"
+    return {"thread_id": session_id, "turn_id": None, "turn": turn, "goal": None, "response": text or final}
+
+
+def claude_session(pane_pids, inventory):
+    claude_pids = agent_processes("claude", pane_pids, inventory)
+    if not claude_pids:
+        return ABSENT
+    if len(claude_pids) != 1:
+        raise ValueError(f"Expected one Claude process in this tmux session; found {len(claude_pids)}")
+    path, session_id = claude_transcript(claude_pids[0])
+    if path is None:
+        return {**ABSENT, "thread_id": session_id, "turn": "idle"}
+    return read_transcript(path, session_id)
 
 
 def approval_visible(screen):
@@ -145,6 +211,19 @@ def approval_visible(screen):
     return (lines.endswith("Press enter to confirm or esc to cancel")
             and re.search(r"^(?:› )?\d+\. Yes, proceed \(y\)$", lines, re.MULTILINE) is not None
             and re.search(r"^(?:› )?\d+\. No, and tell Codex what to do differently \(esc\)$", lines, re.MULTILINE) is not None)
+
+
+def claude_approval_visible(screen):
+    # Match the current dialog's footer and options, never approval text in scrollback.
+    lines = [line.strip() for line in screen.splitlines() if line.strip()]
+    text = "\n".join(lines)
+    return (bool(lines) and lines[-1].startswith("Esc to cancel")
+            and re.search(r"^(?:❯ )?1\. Yes\b", text, re.MULTILINE) is not None
+            and re.search(r"^(?:❯ )?\d+\. No\b", text, re.MULTILINE) is not None)
+
+
+SESSIONS = {"codex": codex_session, "claude": claude_session}
+APPROVALS = {"codex": approval_visible, "claude": claude_approval_visible}
 
 
 async def tmux(*arguments):
@@ -162,7 +241,7 @@ async def tmux(*arguments):
     return output.decode()
 
 
-async def snapshot(sessions):
+async def snapshot(agents):
     output = await tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}\t#{pane_id}")
     panes = {}
     for line in output.splitlines():
@@ -170,16 +249,16 @@ async def snapshot(sessions):
         panes.setdefault(session, {})[int(pid)] = pane_id
     inventory = processes()
     result = {}
-    for session in sessions:
+    for session, kind in agents.items():
         try:
             if session not in panes:
                 raise ValueError("tmux session not found")
-            value = read_session(panes[session], inventory)
+            value = SESSIONS[kind](panes[session], inventory)
             if value["turn"] == "active":
                 for pid, pane_id in panes[session].items():
-                    if codex_processes({pid}, inventory):
+                    if agent_processes(kind, {pid}, inventory):
                         screen = await tmux("capture-pane", "-p", "-J", "-t", pane_id)
-                        if approval_visible(screen):
+                        if APPROVALS[kind](screen):
                             value["turn"] = "approval"
                             break
             result[session] = value
@@ -188,12 +267,12 @@ async def snapshot(sessions):
     return result
 
 
-async def run(sessions, once=False):
+async def run(agents, once=False):
     while True:
         try:
-            values = await snapshot(sessions)
+            values = await snapshot(agents)
         except (OSError, RuntimeError, ValueError) as error:
-            values = {session: {"error": str(error)} for session in sessions}
+            values = {session: {"error": str(error)} for session in agents}
         print(json.dumps(values), flush=True)
         if once:
             return
@@ -203,6 +282,6 @@ async def run(sessions, once=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("sessions", nargs="+")
+    parser.add_argument("agents", nargs="+", metavar="KIND:SESSION")
     args = parser.parse_args()
-    asyncio.run(run(args.sessions, args.once))
+    asyncio.run(run(dict(reversed(item.split(":", 1)) for item in args.agents), args.once))

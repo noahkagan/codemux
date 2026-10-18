@@ -117,7 +117,7 @@ class StatusReaderTests(unittest.TestCase):
         (fds / "2").symlink_to(self.home / "thread-writer-locks" / "root.lock")
         inventory = {10: (1, "bash"), 11: (10, "node"), 20: (11, "codex"), 30: (1, "codex")}
         with patch.object(reader, "PROC", proc):
-            value = reader.read_session({10}, inventory)
+            value = reader.codex_session({10}, inventory)
         self.assertEqual(value["thread_id"], "root")
 
     def test_resumed_editor_thread_maps_from_open_rollout_without_lock(self):
@@ -135,19 +135,19 @@ class StatusReaderTests(unittest.TestCase):
         (fds / "3").symlink_to(child)
         inventory = {10: (1, "bash"), 20: (10, "codex")}
         with patch.object(reader, "PROC", proc):
-            self.assertEqual(reader.read_session({10}, inventory)["thread_id"], "root")
+            self.assertEqual(reader.codex_session({10}, inventory)["thread_id"], "root")
             (fds / "2").unlink()
             with self.assertRaisesRegex(ValueError, "found 0"):
-                reader.read_session({10}, inventory)
+                reader.codex_session({10}, inventory)
 
     def test_multiple_root_threads_are_reported_as_ambiguous(self):
         inventory = {10: (1, "bash"), 20: (10, "codex"), 21: (10, "codex")}
         with patch.object(reader, "root_threads", side_effect=[{(self.home, "root")}, {(self.home, "other")} ]):
             with self.assertRaisesRegex(ValueError, "found 2"):
-                reader.read_session({10}, inventory)
+                reader.codex_session({10}, inventory)
 
     def test_no_codex_process_clears_thread_response_and_goal(self):
-        value = reader.read_session({10}, {10: (1, "bash"), 30: (1, "codex")})
+        value = reader.codex_session({10}, {10: (1, "bash"), 30: (1, "codex")})
         self.assertEqual(value, {"thread_id": None, "turn_id": None, "turn": "absent", "goal": None, "response": None})
 
 
@@ -157,8 +157,8 @@ class SnapshotTests(unittest.IsolatedAsyncioTestCase):
         process.communicate = unittest.mock.AsyncMock(return_value=(b"one\t10\t%0\ntwo\t20\t%1\n", b""))
         with patch.object(reader.asyncio, "create_subprocess_exec", return_value=process), \
              patch.object(reader, "processes", return_value={}), \
-             patch.object(reader, "read_session", side_effect=[{"turn": "finished"}, sqlite3.OperationalError("schema changed")]):
-            values = await reader.snapshot(["one", "two", "missing"])
+             patch.dict(reader.SESSIONS, {"codex": unittest.mock.Mock(side_effect=[{"turn": "finished"}, sqlite3.OperationalError("schema changed")])}):
+            values = await reader.snapshot({"one": "codex", "two": "codex", "missing": "codex"})
         self.assertEqual(values["one"]["turn"], "finished")
         self.assertIn("schema changed", values["two"]["error"])
         self.assertEqual(values["missing"]["error"], "tmux session not found")
