@@ -48,6 +48,7 @@ class Agent:
     session: str
     proxy: str = ""
     web_port: int = 8000
+    agent: str = "codex"
     note: str = field(default="", compare=False)
 
 
@@ -94,7 +95,7 @@ class Observation:
 
 async def watch_host(agents, observations, source, connection, notifications):
     """One SSH stream per host; reconnect without discarding the last response."""
-    sessions = list(dict.fromkeys(item.session for item in agents))
+    sessions = list(dict.fromkeys(f"{item.agent}:{item.session}" for item in agents))
     while True:
         process = None
         diagnostics = None
@@ -516,6 +517,8 @@ def main():
                 raise ValueError("each agent needs a name, host, and tmux session")
             if not isinstance(agent.proxy, str):
                 raise ValueError("proxy must be a string")
+            if agent.agent not in ("codex", "claude"):
+                raise ValueError("agent must be codex or claude")
             if not isinstance(agent.note, str):
                 raise ValueError("note must be a string")
             if type(agent.web_port) is not int or not 1 <= agent.web_port <= 65535:

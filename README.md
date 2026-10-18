@@ -1,13 +1,13 @@
 # codemux
 
-A small terminal dashboard for remote agent sessions and their web pages.
+A small terminal dashboard for remote Codex and Claude Code sessions and their web pages.
 Select an agent, attach to its tmux session, or forward a web server to your browser.
 
 ## Install and run
 
 Requires Linux, Python 3.10+ with `curses` support, and OpenSSH `ssh` on the controller.
 Teleport hosts also require `tsh`.
-The remote hosts need Linux, Python 3.10+ with `sqlite3` support, `tmux`, and Codex. Browser launching uses `xdg-open`.
+The remote hosts need Linux, Python 3.10+ with `sqlite3` support, `tmux`, and Codex or Claude Code. Browser launching uses `xdg-open`.
 Desktop notifications use `notify-send` and the controller's desktop notification service.
 There are no Python packages to install.
 
@@ -80,7 +80,7 @@ Codemux displays SSH errors but does not probe web servers.
 
 ## Desktop notifications
 
-Codemux sends a desktop notification when an agent finishes, fails, is interrupted, awaits approval, or its Codex process stops.
+Codemux sends a desktop notification when an agent finishes, fails, is interrupted, awaits approval, or its agent process stops.
 Notifications include the agent name, host, and a snippet of the latest response or progress message, limited to 240 characters.
 If the process exits, the notification uses its last observed response.
 
@@ -119,15 +119,15 @@ A dropped connection interrupts its active terminal and forwards; status polling
 
 ## Turn, goal, and response
 
-Every three seconds, a reader maps configured tmux sessions to their root Codex threads and reads local SQLite state.
-The reader runs from stdin, installs no files, and opens databases read-only.
+Every three seconds, a reader maps configured tmux sessions to their agent sessions and reads local agent state.
+The reader runs from stdin, installs no files, and opens state read-only.
 It makes no model calls and uses no GPU resources.
 
 The table keeps turn and goal state separate:
 
 - Turn: `active`, `approval`, `finished`, `interrupted`, `failed`, or `idle` before the first recorded turn.
-- Goal: Codex's stored goal state, including `active`, `blocked`, `complete`, `paused`, `usage_limited`, or `budget_limited`.
-- `absent` means the tmux session contains no running Codex process.
+- Goal: Codex's stored goal state, including `active`, `blocked`, `complete`, `paused`, `usage_limited`, or `budget_limited`; `-` for Claude Code.
+- `absent` means the tmux session contains no running agent process.
 - `loading` means the first snapshot has not arrived. `unknown` means no usable snapshot is available.
 - `stale` means polling failed after an earlier successful snapshot. Cached responses remain available and are labeled as cached.
 
@@ -135,10 +135,10 @@ Rows use green for running turns, gray for finished or idle agents, red for fail
 Yellow marks approval prompts, interrupted turns, unavailable status, and blocked, paused, or limited goals when the turn is not running.
 The selected row retains its color with a reversed background. Terminals without color retain the text labels.
 
-Codex's database keeps turns active while awaiting approval.
-For active turns, codemux also reads the visible tmux panes containing Codex and recognizes the standard approval dialog's controls.
+Both agents keep turns active while awaiting approval.
+For active turns, codemux also reads the visible tmux panes containing the agent and recognizes its standard approval dialog's controls.
 Recognized dialogs show `approval` in yellow; the next poll clears this label once the dialog disappears.
-This detection depends on Codex's terminal format and can miss clipped or different dialogs. Other user-input prompts can still appear as `active`.
+This detection depends on each agent's terminal format and can miss clipped or different dialogs. Other user-input prompts can still appear as `active`.
 Codemux does not read scrollback or answer prompts. Enter attaches to tmux so you can review the request there.
 A finished turn does not mean its goal is complete or that no questions need attention.
 
@@ -165,12 +165,14 @@ Long notes are shortened in the table; press `n` to edit them.
 Status polling continues while attached to tmux. SSH failures retry after five seconds; missing snapshots time out after fifteen seconds.
 Restart codemux after changing configuration. It needs a terminal at least 72 columns wide and 12 rows high.
 
-The reader maps open thread locks or rollout logs to SQLite records, including
+For Codex, the reader maps open thread locks or rollout logs to SQLite records, including
 editor-created threads resumed in the CLI. It uses internal database schemas
 verified with Codex CLI `0.154.0` and `0.159.3`.
-Codex upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
-Each configured tmux session must contain exactly one root Codex thread. Subagents are excluded.
+Codex and Claude Code upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
+Each configured Codex tmux session must contain exactly one root Codex thread. Subagents are excluded.
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.
+For Claude Code, the reader was verified with `2.1.187` and `2.1.302`. Claude Code records no failed turns, so `failed` never appears.
+A session with no transcript yet is `idle`. Each tmux session must contain exactly one `claude` process.
 
 macOS status collection is not supported yet: process ancestry and open-file discovery currently use Linux `/proc`.
 Status collection also requires `tmux` and Python 3.10+ on the noninteractive SSH PATH.
@@ -187,6 +189,7 @@ Edit that file and restart codemux. Each entry has these fields:
 | `host` | SSH target, such as `user@machine` or an SSH config alias |
 | `session` | Remote tmux session name |
 | `proxy` | Optional Teleport proxy; omit to use ordinary OpenSSH |
+| `agent` | `codex` (default) or `claude`; selects how status is read |
 | `web_port` | Suggested remote HTTP port; defaults to 8000 and can be changed with `w` |
 | `note` | Optional manual annotation; edit with `n` in the dashboard |
 

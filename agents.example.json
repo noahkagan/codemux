@@ -8,7 +8,8 @@
   {
     "name": "agent-2",
     "host": "user@gpu-2",
-    "session": "codex",
+    "session": "claude",
+    "agent": "claude",
     "proxy": "teleport.example.com",
     "web_port": 8000
   }
