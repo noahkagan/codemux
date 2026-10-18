@@ -105,6 +105,13 @@ class SessionTests(unittest.TestCase):
         value = reader.claude_session({10}, self.inventory)
         self.assertEqual((value["thread_id"], value["turn"]), (SESSION, "active"))
 
+    def test_session_maps_from_process_file(self):
+        sessions = self.home / "claude" / "sessions"
+        sessions.mkdir()
+        (sessions / "20.json").write_text(json.dumps({"pid": 20, "sessionId": SESSION}))
+        self.transcript.write_text(json.dumps(user("go")) + "\n")
+        self.assertEqual(reader.claude_session({10}, self.inventory)["thread_id"], SESSION)
+
     def test_unmappable_process_is_reported(self):
         with self.assertRaisesRegex(ValueError, "not visible"):
             reader.claude_session({10}, self.inventory)

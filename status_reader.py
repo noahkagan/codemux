@@ -176,24 +176,33 @@ def read_transcript(path, session_id):
     return {"thread_id": session_id, "turn_id": None, "turn": turn, "goal": None, "response": text}
 
 
+def claude_session_id(pid):
+    # Older Claude records its session id in a per-process file; newer Claude holds its tasks directory open.
+    try:
+        return json.loads((CLAUDE_HOME / "sessions" / f"{pid}.json").read_text())["sessionId"]
+    except (OSError, KeyError, ValueError):
+        pass
+    for fd in (PROC / str(pid) / "fd").iterdir():
+        try:
+            match = CLAUDE_TASKS.search(os.readlink(fd))
+        except OSError:
+            continue
+        if match:
+            return match[1]
+    raise ValueError("Claude session is not visible for the process")
+
+
 def claude_session(pane_pids, inventory):
     claude_pids = agent_processes("claude", pane_pids, inventory)
     if not claude_pids:
         return ABSENT
     if len(claude_pids) != 1:
         raise ValueError(f"Expected one Claude process in this tmux session; found {len(claude_pids)}")
-    # Claude holds its session's tasks directory open; no transcript file stays open.
-    for fd in (PROC / str(claude_pids[0]) / "fd").iterdir():
-        try:
-            match = CLAUDE_TASKS.search(os.readlink(fd))
-        except OSError:
-            continue
-        if match:
-            path = next(CLAUDE_HOME.glob(f"projects/*/{match[1]}.jsonl"), None)
-            if path is None:
-                return {**ABSENT, "thread_id": match[1], "turn": "idle"}
-            return read_transcript(path, match[1])
-    raise ValueError("Claude session is not visible in the process's open files")
+    session_id = claude_session_id(claude_pids[0])
+    path = next(CLAUDE_HOME.glob(f"projects/*/{session_id}.jsonl"), None)
+    if path is None:
+        return {**ABSENT, "thread_id": session_id, "turn": "idle"}
+    return read_transcript(path, session_id)
 
 
 def approval_visible(screen):

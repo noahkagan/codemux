@@ -171,7 +171,7 @@ verified with Codex CLI `0.154.0` and `0.159.3`.
 Codex and Claude Code upgrades can require reader changes; unreadable or unsupported state is shown as unavailable.
 Each configured Codex tmux session must contain exactly one root Codex thread. Subagents are excluded.
 Sessions with multiple root Codex threads are reported as ambiguous rather than selecting one arbitrarily.
-For Claude Code, the reader was verified with `2.1.302`. Claude Code records no failed turns, so `failed` never appears.
+For Claude Code, the reader was verified with `2.1.187` and `2.1.302`. Claude Code records no failed turns, so `failed` never appears.
 A session with no transcript yet is `idle`. Each tmux session must contain exactly one `claude` process.
 
 macOS status collection is not supported yet: process ancestry and open-file discovery currently use Linux `/proc`.
