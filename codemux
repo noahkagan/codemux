@@ -494,6 +494,48 @@ class Dashboard:
                 await asyncio.gather(*(forward.close() for forward in self.forwards.values()), return_exceptions=True)
 
 
+REMOTE_SEND = """import asyncio, json, sys, types
+request = json.load(sys.stdin)
+for name, source in request['sources'].items():
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(compile(source, name + '.py', 'exec'), module.__dict__)
+try:
+    print(json.dumps(asyncio.run(sys.modules['prompt_sender'].send(request['session'], request['message']))))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+async def send_prompt(agent, message):
+    root = Path(__file__).resolve().parent
+    payload = json.dumps({"session": agent.session, "message": message,
+                          "sources": {name: (root / (name + ".py")).read_text()
+                                      for name in ("status_reader", "prompt_sender")}}).encode()
+    async with Connections([agent]) as connections:
+        command = await connections[agent].command()
+        command.append(shlex.join(["bash", "-lc", shlex.join(["python3", "-c", REMOTE_SEND])]))
+        process = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            output, error = await asyncio.wait_for(process.communicate(payload), timeout=45)
+            if process.returncode:
+                raise RuntimeError(diagnostic(error, "Prompt submission failed; delivery may be unknown"))
+            try:
+                result = json.loads(output)
+            except (ValueError, UnicodeDecodeError):
+                raise RuntimeError("Invalid submission receipt; delivery is unknown") from None
+            if not isinstance(result, dict) or result.get("status") != "queued" or result.get("session") != agent.session:
+                raise RuntimeError("Invalid submission receipt; delivery is unknown")
+            return {"agent": agent.name, **result}
+        except asyncio.TimeoutError:
+            raise RuntimeError("Submission timed out; delivery is unknown. Do not retry blindly.") from None
+        finally:
+            await stop_process(process)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
@@ -502,6 +544,12 @@ def main():
                         help="path to an agent list")
     source.add_argument("--profile", default="agents", metavar="NAME",
                         help="load NAME.json from $XDG_CONFIG_HOME/codemux or ~/.config/codemux (default: agents)")
+    commands = parser.add_subparsers(dest="command")
+    send = commands.add_parser("send", help="queue a prompt for an existing remote Codex session")
+    send.add_argument("agent", help="exact configured agent name")
+    prompt = send.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--message", metavar="TEXT", help="prompt text")
+    prompt.add_argument("--file", metavar="PATH", help="read UTF-8 prompt from PATH, or - for stdin")
     args = parser.parse_args()
     if not args.profile or "/" in args.profile:
         parser.error("profile must be a nonempty name without slashes; use --config for paths")
@@ -527,6 +575,20 @@ def main():
             raise ValueError("config contains duplicate agents")
     except (OSError, ValueError, TypeError) as error:
         parser.error(str(error))
+    if args.command == "send":
+        matches = [agent for agent in agents if agent.name == args.agent]
+        if len(matches) != 1:
+            parser.error("agent name must match exactly one configured entry")
+        try:
+            message = args.message if args.message is not None else (
+                sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8"))
+            if not message.strip() or "\0" in message:
+                parser.error("prompt must contain text and no NUL characters")
+            result = asyncio.run(send_prompt(matches[0], message))
+            print(json.dumps(result))
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(1, f"codemux: {error}\n")
+        return
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("run codemux in an interactive terminal")
     try:

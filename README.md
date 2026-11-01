@@ -78,6 +78,39 @@ The remote web server must already be running.
 Starting a forward prompts for SSH authentication when a shared connection is not already available.
 Codemux displays SSH errors but does not probe web servers.
 
+## Send a prompt
+
+Queue a prompt for the existing Codex thread in a configured session without opening the dashboard:
+
+```bash
+codemux send experiment --message "Review the current changes and report findings."
+codemux send experiment --file /path/to/prompt.txt
+printf '%s\n' 'Report your current status.' | codemux send experiment --file -
+codemux --profile work send experiment --message "Continue the task."
+```
+
+The agent name must identify exactly one configured entry. `--message` and `--file` are mutually exclusive;
+files use UTF-8 and `--file -` reads stdin. Multiline text is passed literally, without shell interpolation.
+Global `--profile` and `--config` options precede `send`.
+
+Codemux resolves the running root thread from the selected tmux session and calls the remote
+`codex queue --thread <id> --message <text>` using that thread's Codex home. It does not type into
+terminal panes, create a session, answer approvals, or change model and sandbox settings.
+Busy sessions receive Codex's queued-message behavior, not an interrupt or an active-turn steer.
+An idle session can start processing the prompt immediately.
+
+The remote Codex must support `queue`. The existing Linux thread-discovery requirements apply;
+missing sessions, absent Codex processes, and ambiguous root threads fail without choosing another target.
+Remote commands use the login-shell PATH. Submission uses noninteractive SSH authentication;
+authenticate separately if required.
+
+Success prints one JSON receipt with `agent`, `session`, `thread_id`, `status: "queued"`, and the
+Codex queue receipt. This acknowledges submission, not task completion. The dashboard can show the response.
+Errors exit nonzero. Codemux never retries a submission: after a timeout or connection loss,
+delivery can be unknown, so inspect the target before retrying.
+
+The prompt and helper source travel over SSH stdin; no helper files are installed remotely.
+
 ## Desktop notifications
 
 Codemux sends a desktop notification when an agent finishes, fails, is interrupted, awaits approval, or its agent process stops.
@@ -220,7 +253,7 @@ codemux --config /path/to/agents.json
 
 `--profile` and `--config` cannot be used together.
 
-The list is configuration, not discovery. Codemux reads existing state; approvals and agent interaction remain inside the attached terminal.
+The list is configuration, not discovery. Codemux reads existing state and can queue prompts with `send`; approvals remain inside the attached terminal.
 Only `agents.example.json` belongs in version control. Keep real hostnames and connection details in your user configuration or an external `--config` file.
 The repository ignores a root-level `agents.json` to prevent accidentally adding a local copy.
 
