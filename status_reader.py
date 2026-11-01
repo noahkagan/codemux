@@ -134,14 +134,21 @@ def agent_processes(kind, pane_pids, inventory):
             if name == kind and belongs_to_pane(pid, pane_pids, inventory)]
 
 
-def codex_session(pane_pids, inventory):
+def session_thread(pane_pids, inventory):
     codex_pids = agent_processes("codex", pane_pids, inventory)
     if not codex_pids:
-        return ABSENT
+        return None
     roots = set().union(*(root_threads(pid) for pid in codex_pids))
     if len(roots) != 1:
         raise ValueError(f"Expected one root Codex thread in this tmux session; found {len(roots)}")
-    return read_thread(*next(iter(roots)))
+    return next(iter(roots))
+
+
+def codex_session(pane_pids, inventory):
+    thread = session_thread(pane_pids, inventory)
+    if thread is None:
+        return ABSENT
+    return read_thread(*thread)
 
 
 def read_transcript(path, session_id):
