@@ -78,20 +78,20 @@ The remote web server must already be running.
 Starting a forward prompts for SSH authentication when a shared connection is not already available.
 Codemux displays SSH errors but does not probe web servers.
 
-## Send a prompt
+## Queue or steer a prompt
 
 Queue a prompt for the existing Codex thread in a configured session without opening the dashboard:
 
 ```bash
-codemux send experiment --message "Review the current changes and report findings."
-codemux send experiment --file /path/to/prompt.txt
-printf '%s\n' 'Report your current status.' | codemux send experiment --file -
-codemux --profile work send experiment --message "Continue the task."
+codemux queue experiment --message "Review the current changes and report findings."
+codemux queue experiment --file /path/to/prompt.txt
+printf '%s\n' 'Report your current status.' | codemux queue experiment --file -
+codemux --profile work queue experiment --message "Continue the task."
 ```
 
 The agent name must identify exactly one configured entry. `--message` and `--file` are mutually exclusive;
 files use UTF-8 and `--file -` reads stdin. Multiline text is passed literally, without shell interpolation.
-Global `--profile` and `--config` options precede `send`.
+Global `--profile` and `--config` options precede `queue` or `steer`.
 
 Codemux resolves the running root thread from the selected tmux session and calls the remote
 `codex queue --thread <id> --message <text>` using that thread's Codex home. It does not type into
@@ -99,7 +99,22 @@ terminal panes, create a session, answer approvals, or change model and sandbox 
 Busy sessions receive Codex's queued-message behavior, not an interrupt or an active-turn steer.
 An idle session can start processing the prompt immediately.
 
-The remote Codex must support `queue`. The existing Linux thread-discovery requirements apply;
+To correct an active turn immediately, use:
+
+```bash
+codemux steer experiment --message "Keep the change scoped to the parser."
+```
+
+`steer` uses the existing Codex app-server over its Unix WebSocket control socket.
+It reads the active turn and calls `turn/steer` with `expectedTurnId`, without
+interrupting the turn or its background work. If idle, it calls `turn/start`.
+A turn that changes during steering produces an error; no blind retry occurs.
+The receipt reports `status: "steered"` or `"started"` and the accepted `turn_id`.
+This confirms API acceptance, not that the agent has read or completed the instruction.
+There is no `send` command; choose delivery timing explicitly.
+
+The remote Codex must support `queue` and the app-server control socket.
+Steering also requires `uv`; it caches the pinned `websockets==15.0.1` client library. The existing Linux thread-discovery requirements apply;
 missing sessions, absent Codex processes, and ambiguous root threads fail without choosing another target.
 Remote commands use the login-shell PATH. Submission uses noninteractive SSH authentication;
 authenticate separately if required.
@@ -253,7 +268,7 @@ codemux --config /path/to/agents.json
 
 `--profile` and `--config` cannot be used together.
 
-The list is configuration, not discovery. Codemux reads existing state and can queue prompts with `send`; approvals remain inside the attached terminal.
+The list is configuration, not discovery. Codemux reads existing state and can queue or steer prompts with `queue` or `steer`; approvals remain inside the attached terminal.
 Only `agents.example.json` belongs in version control. Keep real hostnames and connection details in your user configuration or an external `--config` file.
 The repository ignores a root-level `agents.json` to prevent accidentally adding a local copy.
 

@@ -99,13 +99,13 @@ class SendCommandTests(unittest.TestCase):
         self.dashboard = self.enterContext(patch.object(app.curses, 'wrapper'))
 
     def run_command(self, arguments):
-        with patch.object(app.sys, 'argv', ['codemux', '--config', str(self.config), 'send', *arguments]):
+        with patch.object(app.sys, 'argv', ['codemux', '--config', str(self.config), 'queue', *arguments]):
             app.main()
 
     def test_message_without_tty_prints_receipt(self):
         message = 'hello\nsecond line'
         self.run_command(['agent', '--message', message])
-        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message)
+        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message, "queue")
         self.assertEqual(json.loads(self.stdout.getvalue()), self.receipt)
         self.dashboard.assert_not_called()
 
@@ -114,14 +114,14 @@ class SendCommandTests(unittest.TestCase):
         path = self.root / 'prompt.txt'
         path.write_text(message, encoding='utf-8')
         self.run_command(['agent', '--file', str(path)])
-        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message)
+        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message, "queue")
 
     def test_stdin_preserves_multiline_prompt(self):
         message = 'hello\nsecond line\n'
         self.stdin.write(message)
         self.stdin.seek(0)
         self.run_command(['agent', '--file', '-'])
-        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message)
+        self.sender.assert_awaited_once_with(app.Agent(**self.entry), message, "queue")
 
     def test_unknown_and_ambiguous_agent_names_fail_before_sending(self):
         for entries, target in (([self.entry], 'agen'),
@@ -155,6 +155,20 @@ class SendCommandTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 1)
         self.assertEqual(self.stdout.getvalue(), '')
         self.assertIn('delivery is unknown', self.stderr.getvalue())
+
+    def test_steer_routes_explicit_mode(self):
+        with patch.object(app.sys, 'argv', ['codemux', '--config', str(self.config),
+                                          'steer', 'agent', '--message', 'hello']):
+            app.main()
+        self.sender.assert_awaited_once_with(app.Agent(**self.entry), 'hello', 'steer')
+
+    def test_send_is_removed(self):
+        with patch.object(app.sys, 'argv', ['codemux', '--config', str(self.config),
+                                          'send', 'agent', '--message', 'hello']):
+            with self.assertRaises(SystemExit) as error:
+                app.main()
+        self.assertEqual(error.exception.code, 2)
+        self.sender.assert_not_awaited()
 
 
 class SendTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -200,3 +214,68 @@ class SendTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'delivery is unknown'):
             await app.send_prompt(self.agent, 'hello')
         self.stop.assert_awaited_once_with(self.process)
+
+
+class SteerProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def invoke(self, turns, reject=False):
+        import sys
+        import types
+        requests = []
+        responses = asyncio.Queue()
+
+        class Connection:
+            async def send(self, raw):
+                request = json.loads(raw)
+                requests.append(request)
+                method = request["method"]
+                if "id" not in request:
+                    return
+                result = {}
+                if method == "thread/read":
+                    result = {"thread": {"turns": turns}}
+                elif method == "turn/steer":
+                    result = {"turnId": "active"}
+                elif method == "turn/start":
+                    result = {"turn": {"id": "new"}}
+                response = {"id": request["id"], "result": result}
+                if reject and method == "turn/steer":
+                    response = {"id": request["id"], "error": {"message": "turn changed"}}
+                await responses.put(json.dumps({"method": "unrelated/event", "params": {}}))
+                await responses.put(json.dumps(response))
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await responses.get()
+
+        context = Mock()
+        context.__aenter__ = AsyncMock(return_value=Connection())
+        context.__aexit__ = AsyncMock(return_value=False)
+        connect = Mock(return_value=context)
+        modules = {name: types.ModuleType(name) for name in
+                   ("websockets", "websockets.asyncio", "websockets.asyncio.client")}
+        modules["websockets.asyncio.client"].unix_connect = connect
+        self.requests = requests
+        with patch.dict(sys.modules, modules):
+            result = await prompt_sender.steer("root", "literal \n text", {"CODEX_HOME": "/custom/home"})
+        self.assertEqual(connect.call_args.args[0], "/custom/home/app-server-control/app-server-control.sock")
+        return result
+
+    async def test_idle_starts_turn_without_resume_or_interrupt(self):
+        result = await self.invoke([{"id": "old", "status": "completed"}])
+        self.assertEqual(result, {"status": "started", "turn_id": "new"})
+        self.assertEqual([r["method"] for r in self.requests],
+                         ["initialize", "initialized", "thread/read", "turn/start"])
+
+    async def test_active_steers_exact_turn_and_preserves_literal_input(self):
+        result = await self.invoke([{"id": "active", "status": "inProgress"}])
+        self.assertEqual(result, {"status": "steered", "turn_id": "active"})
+        self.assertEqual(self.requests[-1]["params"], {
+            "threadId": "root", "expectedTurnId": "active",
+            "input": [{"type": "text", "text": "literal \n text"}]})
+
+    async def test_changed_turn_fails_without_starting_or_retrying(self):
+        with self.assertRaisesRegex(RuntimeError, "turn changed"):
+            await self.invoke([{"id": "active", "status": "inProgress"}], reject=True)
+        self.assertEqual(len(self.requests), 4)

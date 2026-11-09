@@ -501,21 +501,23 @@ for name, source in request['sources'].items():
     sys.modules[name] = module
     exec(compile(source, name + '.py', 'exec'), module.__dict__)
 try:
-    print(json.dumps(asyncio.run(sys.modules['prompt_sender'].send(request['session'], request['message']))))
+    print(json.dumps(asyncio.run(sys.modules['prompt_sender'].send(request['session'], request['message'], request['mode']))))
 except Exception as error:
     print(str(error), file=sys.stderr)
     sys.exit(1)
 """
 
 
-async def send_prompt(agent, message):
+async def send_prompt(agent, message, mode="queue"):
     root = Path(__file__).resolve().parent
-    payload = json.dumps({"session": agent.session, "message": message,
+    payload = json.dumps({"session": agent.session, "message": message, "mode": mode,
                           "sources": {name: (root / (name + ".py")).read_text()
                                       for name in ("status_reader", "prompt_sender")}}).encode()
     async with Connections([agent]) as connections:
         command = await connections[agent].command()
-        command.append(shlex.join(["bash", "-lc", shlex.join(["python3", "-c", REMOTE_SEND])]))
+        interpreter = (["uv", "run", "--no-project", "--with", "websockets==15.0.1", "python3"]
+                       if mode == "steer" else ["python3"])
+        command.append(shlex.join(["bash", "-lc", shlex.join([*interpreter, "-c", REMOTE_SEND])]))
         process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -527,7 +529,10 @@ async def send_prompt(agent, message):
                 result = json.loads(output)
             except (ValueError, UnicodeDecodeError):
                 raise RuntimeError("Invalid submission receipt; delivery is unknown") from None
-            if not isinstance(result, dict) or result.get("status") != "queued" or result.get("session") != agent.session:
+            statuses = {"queued"} if mode == "queue" else {"steered", "started"}
+            if (not isinstance(result, dict) or result.get("status") not in statuses
+                    or result.get("session") != agent.session
+                    or (mode == "steer" and not result.get("turn_id"))):
                 raise RuntimeError("Invalid submission receipt; delivery is unknown")
             return {"agent": agent.name, **result}
         except asyncio.TimeoutError:
@@ -545,11 +550,13 @@ def main():
     source.add_argument("--profile", default="agents", metavar="NAME",
                         help="load NAME.json from $XDG_CONFIG_HOME/codemux or ~/.config/codemux (default: agents)")
     commands = parser.add_subparsers(dest="command")
-    send = commands.add_parser("send", help="queue a prompt for an existing remote Codex session")
-    send.add_argument("agent", help="exact configured agent name")
-    prompt = send.add_mutually_exclusive_group(required=True)
-    prompt.add_argument("--message", metavar="TEXT", help="prompt text")
-    prompt.add_argument("--file", metavar="PATH", help="read UTF-8 prompt from PATH, or - for stdin")
+    for mode, description in (("queue", "deliver after the active turn finishes"),
+                              ("steer", "steer the active turn, or start a turn if idle")):
+        command = commands.add_parser(mode, help=description)
+        command.add_argument("agent", help="exact configured agent name")
+        prompt = command.add_mutually_exclusive_group(required=True)
+        prompt.add_argument("--message", metavar="TEXT", help="prompt text")
+        prompt.add_argument("--file", metavar="PATH", help="read UTF-8 prompt from PATH, or - for stdin")
     args = parser.parse_args()
     if not args.profile or "/" in args.profile:
         parser.error("profile must be a nonempty name without slashes; use --config for paths")
@@ -575,7 +582,7 @@ def main():
             raise ValueError("config contains duplicate agents")
     except (OSError, ValueError, TypeError) as error:
         parser.error(str(error))
-    if args.command == "send":
+    if args.command in ("queue", "steer"):
         matches = [agent for agent in agents if agent.name == args.agent]
         if len(matches) != 1:
             parser.error("agent name must match exactly one configured entry")
@@ -584,7 +591,7 @@ def main():
                 sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8"))
             if not message.strip() or "\0" in message:
                 parser.error("prompt must contain text and no NUL characters")
-            result = asyncio.run(send_prompt(matches[0], message))
+            result = asyncio.run(send_prompt(matches[0], message, args.command))
             print(json.dumps(result))
         except (OSError, ValueError, RuntimeError) as error:
             parser.exit(1, f"codemux: {error}\n")
