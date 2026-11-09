@@ -78,6 +78,23 @@ The remote web server must already be running.
 Starting a forward prompts for SSH authentication when a shared connection is not already available.
 Codemux displays SSH errors but does not probe web servers.
 
+## Read an agent
+
+```bash
+codemux read experiment
+codemux --profile work read experiment
+```
+
+Returns one JSON snapshot with `agent`, `session`, `thread_id`, `turn_id`, `turn`,
+`goal`, and `response`. The response contains its text, timestamp, and whether it
+is progress or a final answer. Active turns show their latest progress message;
+otherwise the reader falls back to the latest final answer, which may be from an
+older turn. A missing response is `null`.
+
+This uses the dashboard's existing read-only reader for Codex and Claude. It does
+not send a prompt, resume a thread, or interrupt work. Missing or ambiguous sessions
+exit nonzero; a session with no running agent reports `turn: "absent"`.
+
 ## Queue or steer a prompt
 
 Queue a prompt for the existing Codex thread in a configured session without opening the dashboard:

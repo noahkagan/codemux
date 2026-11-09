@@ -170,6 +170,16 @@ class SendCommandTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         self.sender.assert_not_awaited()
 
+    def test_read_requires_no_message_and_prints_snapshot(self):
+        snapshot = {'agent': 'agent', 'session': 'work', 'turn': 'finished',
+                    'response': {'text': 'Done', 'kind': 'final'}}
+        self.sender.return_value = snapshot
+        with patch.object(app.sys, 'argv', ['codemux', '--config', str(self.config), 'read', 'agent']):
+            app.main()
+        self.sender.assert_awaited_once_with(app.Agent(**self.entry), None, 'read')
+        self.assertEqual(json.loads(self.stdout.getvalue()), snapshot)
+        self.dashboard.assert_not_called()
+
 
 class SendTransportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -214,6 +224,21 @@ class SendTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'delivery is unknown'):
             await app.send_prompt(self.agent, 'hello')
         self.stop.assert_awaited_once_with(self.process)
+
+    async def test_read_uses_only_existing_reader_and_validates_snapshot(self):
+        snapshot = {'session': 'work', 'turn': 'active', 'response': None}
+        self.process.communicate.return_value = (json.dumps(snapshot).encode(), b'')
+        result = await app.send_prompt(self.agent, None, 'read')
+        payload = json.loads(self.process.communicate.call_args.args[0])
+        self.assertEqual(set(payload['sources']), {'status_reader'})
+        self.assertEqual(payload['kind'], 'codex')
+        self.assertEqual(result, {'agent': 'agent', **snapshot})
+
+    async def test_read_timeout_does_not_claim_delivery(self):
+        self.process.communicate.side_effect = asyncio.TimeoutError
+        with self.assertRaisesRegex(RuntimeError, 'Status read timed out'):
+            await app.send_prompt(self.agent, None, 'read')
+        self.stop.assert_awaited_once()
 
 
 class SteerProtocolTests(unittest.IsolatedAsyncioTestCase):

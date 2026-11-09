@@ -501,7 +501,15 @@ for name, source in request['sources'].items():
     sys.modules[name] = module
     exec(compile(source, name + '.py', 'exec'), module.__dict__)
 try:
-    print(json.dumps(asyncio.run(sys.modules['prompt_sender'].send(request['session'], request['message'], request['mode']))))
+    if request['mode'] == 'read':
+        values = asyncio.run(sys.modules['status_reader'].snapshot({request['session']: request['kind']}))
+        result = values[request['session']]
+        if 'error' in result:
+            raise RuntimeError(result['error'])
+        result = {'session': request['session'], **result}
+    else:
+        result = asyncio.run(sys.modules['prompt_sender'].send(request['session'], request['message'], request['mode']))
+    print(json.dumps(result))
 except Exception as error:
     print(str(error), file=sys.stderr)
     sys.exit(1)
@@ -510,9 +518,9 @@ except Exception as error:
 
 async def send_prompt(agent, message, mode="queue"):
     root = Path(__file__).resolve().parent
-    payload = json.dumps({"session": agent.session, "message": message, "mode": mode,
+    payload = json.dumps({"session": agent.session, "message": message, "mode": mode, "kind": agent.agent,
                           "sources": {name: (root / (name + ".py")).read_text()
-                                      for name in ("status_reader", "prompt_sender")}}).encode()
+                                      for name in (("status_reader",) if mode == "read" else ("status_reader", "prompt_sender"))}}).encode()
     async with Connections([agent]) as connections:
         command = await connections[agent].command()
         interpreter = (["uv", "run", "--no-project", "--with", "websockets==15.0.1", "python3"]
@@ -529,6 +537,11 @@ async def send_prompt(agent, message, mode="queue"):
                 result = json.loads(output)
             except (ValueError, UnicodeDecodeError):
                 raise RuntimeError("Invalid submission receipt; delivery is unknown") from None
+            if mode == "read":
+                if (not isinstance(result, dict) or result.get("session") != agent.session
+                        or "turn" not in result or "response" not in result):
+                    raise RuntimeError("Invalid status snapshot")
+                return {"agent": agent.name, **result}
             statuses = {"queued"} if mode == "queue" else {"steered", "started"}
             if (not isinstance(result, dict) or result.get("status") not in statuses
                     or result.get("session") != agent.session
@@ -536,6 +549,8 @@ async def send_prompt(agent, message, mode="queue"):
                 raise RuntimeError("Invalid submission receipt; delivery is unknown")
             return {"agent": agent.name, **result}
         except asyncio.TimeoutError:
+            if mode == "read":
+                raise RuntimeError("Status read timed out") from None
             raise RuntimeError("Submission timed out; delivery is unknown. Do not retry blindly.") from None
         finally:
             await stop_process(process)
@@ -557,6 +572,8 @@ def main():
         prompt = command.add_mutually_exclusive_group(required=True)
         prompt.add_argument("--message", metavar="TEXT", help="prompt text")
         prompt.add_argument("--file", metavar="PATH", help="read UTF-8 prompt from PATH, or - for stdin")
+    read = commands.add_parser("read", help="read latest response and turn status without changing the session")
+    read.add_argument("agent", help="exact configured agent name")
     args = parser.parse_args()
     if not args.profile or "/" in args.profile:
         parser.error("profile must be a nonempty name without slashes; use --config for paths")
@@ -582,11 +599,14 @@ def main():
             raise ValueError("config contains duplicate agents")
     except (OSError, ValueError, TypeError) as error:
         parser.error(str(error))
-    if args.command in ("queue", "steer"):
+    if args.command in ("queue", "steer", "read"):
         matches = [agent for agent in agents if agent.name == args.agent]
         if len(matches) != 1:
             parser.error("agent name must match exactly one configured entry")
         try:
+            if args.command == "read":
+                print(json.dumps(asyncio.run(send_prompt(matches[0], None, "read"))))
+                return
             message = args.message if args.message is not None else (
                 sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8"))
             if not message.strip() or "\0" in message:
